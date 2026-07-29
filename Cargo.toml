@@ -5,23 +5,31 @@ edition = "2024"
 authors = ["Maple Bamboo Team"]
 license = "ISC"
 repository = "https://github.com/Harvey2433/VeriHash"
+description = "Cross-platform interactive file hashing and verification tool"
+readme = "README.md"
 
 [dependencies]
 # 交互菜单（多选、输入、确认）
 dialoguer = "0.11"
 # 进度条 + Spinner 动画
 indicatif = "0.17"
+# 终端状态颜色
+console = "0.15"
 # 并行计算与线程池
 rayon = "1.8"
 # 任务队列（配合 rayon 做批量任务）
 crossbeam-channel = "0.5"
 # 通配符路径匹配（支持 **/*）
 glob = "0.3"
+# BlazeHash/Hashdeep 清单中的 CSV 记录
+csv = "1.3"
 # 哈希算法
-md5 = "0.7"
-sha2 = "0.10"     # SHA256 / SHA512
-sha3 = "0.10"     # SHA3 全系列
-blake3 = "1.5"    # BLAKE3
+fast-md5 = "1.0.0"
+sha2 = "0.10"
+sha3 = "0.10"
+blake2b_simd = "1.0.4"
+blake2s_simd = "1.0.4"
+blake3 = { version = "1.5", features = ["rayon"] }
 # 临时文件（边算边写，不占内存）
 tempfile = "3.8"
 # CPU 核心数检测
@@ -29,14 +37,30 @@ num_cpus = "1.16"
 # 优雅的错误处理
 anyhow = "1.0"
 
+[target.'cfg(windows)'.dependencies]
+compio = { version = "0.19.1", default-features = false, features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies.windows-sys]
+version = "0.61.2"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+]
+
 [profile.release]
-# 最高强度优化：L3 级激进优化
+# 最高强度优化
 opt-level = 3
-# 开启 LTO：让编译器在全局范围内进行优化，消除跨模块的冗余
 lto = true
-# 强制单线程编译单元：虽然编译慢，但能产生更优化的代码
+# 单线程编译单元
 codegen-units = 1
-# 斩杀所有符号：彻底剥离调试信息，让 exe 变得又小又神秘
+# 剥离调试信息
 strip = "symbols"
-# 异常处理：直接中止，减少二进制体积和攻击面
-panic = "abort"
+# 异常处理：退出
+#panic = "abort"
