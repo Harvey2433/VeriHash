@@ -238,17 +238,28 @@ impl WindowsHashWorker {
         let profile = self.profile_for(path);
         let request_size = profile.request_size(size, self.parallelism);
         performance::record_request_size(request_size);
-        let buffers = match self.buffers.take() {
+        let mut buffers = match self.buffers.take() {
             Some((first, second))
-                if first.capacity() == request_size && second.capacity() == request_size =>
+                if first.can_serve(request_size, profile.io_alignment)
+                    && second.can_serve(request_size, profile.io_alignment) =>
             {
                 (first, second)
             }
-            _ => (
-                AlignedBuffer::new(request_size, profile.io_alignment)?,
-                AlignedBuffer::new(request_size, profile.io_alignment)?,
-            ),
+            _ => {
+                let capacity = buffer_growth_capacity(request_size, profile.io_alignment)
+                    .context("I/O 缓冲区增长大小溢出")?;
+                (
+                    AlignedBuffer::new(capacity, profile.io_alignment)?,
+                    AlignedBuffer::new(capacity, profile.io_alignment)?,
+                )
+            }
         };
+        buffers
+            .0
+            .set_request_size(request_size, profile.io_alignment)?;
+        buffers
+            .1
+            .set_request_size(request_size, profile.io_alignment)?;
 
         let direct = profile.direct;
         let mut attempt = self.runtime.block_on(read_and_hash(
@@ -426,7 +437,7 @@ where
         let remaining = expected_size - processed;
         let accepted = usize::try_from(remaining).unwrap_or(usize::MAX).min(count);
         let next_offset = processed + accepted as u64;
-        if count < current.capacity() && next_offset < expected_size {
+        if count < current.request_size() && next_offset < expected_size {
             performance::record_short_read();
         }
 
@@ -532,7 +543,9 @@ async fn open_hash_file(path: &Path, direct: bool) -> io::Result<compio::fs::Fil
 struct AlignedBuffer {
     base: NonNull<c_void>,
     ptr: NonNull<u8>,
-    capacity: usize,
+    allocation_capacity: usize,
+    request_size: usize,
+    alignment: usize,
     initialized: usize,
 }
 
@@ -552,13 +565,42 @@ impl AlignedBuffer {
         Ok(Self {
             base,
             ptr,
-            capacity,
+            allocation_capacity: capacity,
+            request_size: capacity,
+            alignment,
             initialized: 0,
         })
     }
 
-    fn capacity(&self) -> usize {
-        self.capacity
+    fn allocation_capacity(&self) -> usize {
+        self.allocation_capacity
+    }
+
+    fn request_size(&self) -> usize {
+        self.request_size
+    }
+
+    fn can_serve(&self, request_size: usize, alignment: usize) -> bool {
+        self.allocation_capacity() >= request_size
+            && self.alignment >= alignment
+            && self.alignment.is_multiple_of(alignment)
+    }
+
+    fn set_request_size(&mut self, request_size: usize, required_alignment: usize) -> Result<()> {
+        if request_size == 0
+            || request_size > self.allocation_capacity()
+            || !self.can_serve(request_size, required_alignment)
+            || !request_size.is_multiple_of(required_alignment)
+        {
+            return Err(anyhow!(
+                "无效的 Direct I/O 请求大小 {request_size}（容量 {}，缓冲区对齐 {}，所需对齐 {required_alignment}）",
+                self.allocation_capacity(),
+                self.alignment
+            ));
+        }
+        self.request_size = request_size;
+        self.initialized = 0;
+        Ok(())
     }
 }
 
@@ -573,7 +615,7 @@ impl IoBufMut for AlignedBuffer {
         unsafe {
             std::slice::from_raw_parts_mut(
                 self.ptr.as_ptr().cast::<MaybeUninit<u8>>(),
-                self.capacity,
+                self.request_size,
             )
         }
     }
@@ -581,7 +623,7 @@ impl IoBufMut for AlignedBuffer {
 
 impl SetLen for AlignedBuffer {
     unsafe fn set_len(&mut self, len: usize) {
-        debug_assert!(len <= self.capacity);
+        debug_assert!(len <= self.request_size);
         self.initialized = len;
     }
 }
@@ -601,6 +643,12 @@ fn round_up(value: usize, alignment: usize) -> Option<usize> {
     value
         .checked_add(alignment - 1)
         .map(|value| value / alignment * alignment)
+}
+
+fn buffer_growth_capacity(request_size: usize, alignment: usize) -> Option<usize> {
+    let target = request_size.max(MIN_REQUEST_SIZE).max(alignment);
+    let target = target.checked_next_power_of_two()?;
+    round_up(target, alignment)
 }
 
 fn valid_sector(value: u32) -> Option<u32> {
@@ -820,13 +868,31 @@ mod tests {
         assert_eq!(round_up(1, 4096), Some(4096));
         assert_eq!(round_up(4096, 4096), Some(4096));
         assert_eq!(round_up(4097, 4096), Some(8192));
+        assert_eq!(buffer_growth_capacity(1, 4096), Some(64 * 1024));
+        assert_eq!(buffer_growth_capacity(65_537, 4096), Some(128 * 1024));
+        assert_eq!(
+            buffer_growth_capacity(2 * 1024 * 1024, 4096),
+            Some(2 * 1024 * 1024)
+        );
     }
 
     #[test]
     fn virtual_alloc_buffer_has_requested_alignment() {
-        let buffer = AlignedBuffer::new(65_537, 4096).unwrap();
-        assert_eq!(buffer.capacity() % 4096, 0);
+        let mut buffer = AlignedBuffer::new(128 * 1024, 4096).unwrap();
+        assert_eq!(buffer.allocation_capacity() % 4096, 0);
         assert_eq!(buffer.ptr.as_ptr() as usize % 4096, 0);
+        buffer.set_request_size(4096, 4096).unwrap();
+        assert_eq!(buffer.allocation_capacity(), 128 * 1024);
+        assert_eq!(buffer.request_size(), 4096);
+        assert_eq!(buffer.as_uninit().len(), 4096);
+    }
+
+    #[test]
+    fn over_aligned_buffer_can_serve_a_smaller_volume_alignment() {
+        let mut buffer = AlignedBuffer::new(128 * 1024, 64 * 1024).unwrap();
+        assert!(buffer.can_serve(4096, 4096));
+        buffer.set_request_size(4096, 4096).unwrap();
+        assert_eq!(buffer.request_size(), 4096);
     }
 
     #[test]
