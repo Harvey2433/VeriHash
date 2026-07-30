@@ -56,7 +56,7 @@ pub fn run() -> Result<()> {
 
 fn maybe_write_performance_report(theme: &CliTheme) -> Result<()> {
     eprintln!();
-    if !ask_confirm(theme, "是否输出性能报告？", false)? {
+    if !ask_confirm(theme, "是否输出性能报告?", false)? {
         return Ok(());
     }
     let path = performance::write_report(PathBuf::from(".").as_path())?;
@@ -104,8 +104,8 @@ fn run_compute(theme: &CliTheme) -> Result<()> {
     if summary.files == 0 {
         bail!("没有匹配到可处理文件");
     }
-    eprintln!(
-        "  匹配到 {} 个文件（总计 {}），算法：{}{}",
+    print_ok(format!(
+        "匹配到 {} 个文件 (总计 {}), 算法: {}{}",
         summary.files,
         human_bytes(summary.bytes),
         algorithms
@@ -114,12 +114,12 @@ fn run_compute(theme: &CliTheme) -> Result<()> {
             .collect::<Vec<_>>()
             .join(", "),
         if summary.skipped > 0 {
-            format!("，跳过 {} 项", summary.skipped)
+            format!(", 跳过 {} 项", summary.skipped)
         } else {
             String::new()
         }
-    );
-    let confirmed = ask_confirm(theme, "确认开始计算？", true)?;
+    ));
+    let confirmed = ask_confirm(theme, "确认开始计算?", true)?;
     if !confirmed {
         return Ok(());
     }
@@ -137,7 +137,7 @@ fn run_compute(theme: &CliTheme) -> Result<()> {
         failed_files,
     );
     if !outcome.failures.is_empty() {
-        eprintln!("\n{} 个文件处理失败：", outcome.failures.len());
+        eprintln!("\n{} 个文件处理失败:", outcome.failures.len());
         for failure in outcome.failures.iter().take(20) {
             eprintln!("  {failure}");
         }
@@ -148,7 +148,7 @@ fn run_compute(theme: &CliTheme) -> Result<()> {
 
     if summary.files <= 10 {
         print_grouped_results(&algorithms, &mut outcome.display_results);
-        if !ask_confirm(theme, "是否将结果写入文件？", true)? {
+        if !ask_confirm(theme, "是否将结果写入文件?", true)? {
             return finish_compute(outcome.failures);
         }
     }
@@ -169,7 +169,7 @@ fn run_compute(theme: &CliTheme) -> Result<()> {
     if !existing.is_empty()
         && !ask_confirm(
             theme,
-            &format!("{} 个输出文件已存在，是否覆盖？", existing.len()),
+            &format!("{} 个输出文件已存在, 是否覆盖?", existing.len()),
             false,
         )?
     {
@@ -179,7 +179,8 @@ fn run_compute(theme: &CliTheme) -> Result<()> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+            .unwrap_or_else(|_| ProgressStyle::default_spinner())
+            .tick_chars(SPINNER_CHARS),
     );
     spinner.set_message("正在写入结果");
     spinner.enable_steady_tick(Duration::from_millis(100));
@@ -233,10 +234,10 @@ fn run_verify(theme: &CliTheme) -> Result<()> {
         for conflict in &discovery.conflicts {
             eprintln!("冲突: {conflict}");
         }
-        bail!("清单存在冲突，未开始校验");
+        bail!("清单存在冲突, 未开始校验");
     }
     if !discovery.missing.is_empty() {
-        eprintln!("清单引用了 {} 个不存在的文件：", discovery.missing.len());
+        eprintln!("清单引用了 {} 个不存在的文件:", discovery.missing.len());
         for path in discovery.missing.iter().take(20) {
             eprintln!("  MISSING  {}", path.display());
         }
@@ -244,7 +245,7 @@ fn run_verify(theme: &CliTheme) -> Result<()> {
 
     if discovery.unmatched_total > 100 {
         bail!(
-            "有 {} 个文件没有摘要，超过人工输入上限；请缩小输入范围或补充清单",
+            "有 {} 个文件没有摘要, 超过人工输入上限; 请缩小输入范围或补充清单",
             discovery.unmatched_total
         );
     }
@@ -252,7 +253,7 @@ fn run_verify(theme: &CliTheme) -> Result<()> {
     for file in unmatched {
         if !ask_confirm(
             theme,
-            &format!("{} 未检测到摘要，是否手动输入？", file.relative.display()),
+            &format!("{} 未检测到摘要, 是否手动输入?", file.relative.display()),
             true,
         )? {
             continue;
@@ -305,7 +306,7 @@ fn run_verify(theme: &CliTheme) -> Result<()> {
         ),
         Style::new().green().bold(),
     );
-    let confirmed = ask_confirm(theme, "确认开始校验？", true)?;
+    let confirmed = ask_confirm(theme, "确认开始校验?", true)?;
     if !confirmed {
         return Ok(());
     }
@@ -333,7 +334,7 @@ fn run_verify(theme: &CliTheme) -> Result<()> {
     }
     let failed = outcome.failed.len() + outcome.errors.len() + discovery.missing.len();
     if failed > 0 {
-        bail!("校验完成，{failed} 个文件失败或缺失")
+        bail!("校验完成, {failed} 个文件失败或缺失")
     }
     Ok(())
 }
@@ -392,7 +393,7 @@ fn prompt_blake2_bits(theme: &CliTheme, family: &str, default: u16) -> Result<u8
 
 fn prompt_input(theme: &CliTheme) -> Result<InputSpec> {
     let value: String = Input::with_theme(theme)
-        .with_prompt("输入文件、目录或通配符路径")
+        .with_prompt("输入文件, 目录或通配符路径")
         .default(".".to_string())
         .interact_text()?;
     let input = InputSpec::parse(&value)?;
@@ -462,6 +463,14 @@ fn print_status(label: &str, message: String, label_style: Style) {
         "{} {}",
         label_style.apply_to(format!("{label:>12}")),
         style(message).white()
+    );
+}
+
+fn print_ok(message: String) {
+    eprintln!(
+        "  {} {}",
+        style("OK").for_stderr().green().bold(),
+        style(message).for_stderr().white()
     );
 }
 

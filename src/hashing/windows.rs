@@ -15,17 +15,21 @@ use std::ptr::{NonNull, null, null_mut};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    BusTypeNvme, BusTypeSata, BusTypeScsi, BusTypeUsb, CreateFileW, FILE_FLAG_NO_BUFFERING,
-    FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    FILE_STORAGE_INFO, FileStorageInfo, GetFileInformationByHandleEx, GetVolumeInformationW,
-    GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, OPEN_EXISTING,
+    BusType1394, BusTypeAta, BusTypeAtapi, BusTypeFibre, BusTypeFileBackedVirtual, BusTypeMmc,
+    BusTypeNvme, BusTypeRAID, BusTypeSCM, BusTypeSas, BusTypeSata, BusTypeScsi, BusTypeSd,
+    BusTypeSpaces, BusTypeSsa, BusTypeUfs, BusTypeUnknown, BusTypeUsb, BusTypeVirtual,
+    BusTypeiScsi, CreateFileW, FILE_FLAG_NO_BUFFERING, FILE_FLAG_SEQUENTIAL_SCAN,
+    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STORAGE_INFO, FileStorageInfo,
+    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
+    GetVolumePathNameW, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
     DEVICE_SEEK_PENALTY_DESCRIPTOR, DEVICE_TRIM_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY,
-    PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_DEVICE_DESCRIPTOR,
-    STORAGE_PROPERTY_ID, STORAGE_PROPERTY_QUERY, StorageAccessAlignmentProperty,
-    StorageDeviceProperty, StorageDeviceSeekPenaltyProperty, StorageDeviceTrimProperty,
+    PropertyStandardQuery, STORAGE_ACCESS_ALIGNMENT_DESCRIPTOR, STORAGE_ADAPTER_DESCRIPTOR,
+    STORAGE_DEVICE_DESCRIPTOR, STORAGE_PROPERTY_ID, STORAGE_PROPERTY_QUERY,
+    StorageAccessAlignmentProperty, StorageAdapterProperty, StorageDeviceProperty,
+    StorageDeviceSeekPenaltyProperty, StorageDeviceTrimProperty,
 };
 use windows_sys::Win32::System::Memory::{
     MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
@@ -33,16 +37,20 @@ use windows_sys::Win32::System::Memory::{
 use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
 const FALLBACK_ALIGNMENT: usize = 4096;
+const MAX_SECTOR_SIZE: u32 = 1024 * 1024;
 const MIN_REQUEST_SIZE: usize = 64 * 1024;
 const MAX_REQUEST_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StorageKind {
+enum MediaKind {
     Nvme,
-    SataSsd,
+    Ssd,
     Hdd,
-    Usb,
+    Flash,
+    Optical,
+    PersistentMemory,
     Network,
+    Virtual,
     Unknown,
 }
 
@@ -52,37 +60,41 @@ pub fn parallelism_limits(path: &Path, files: usize, algorithm_count: usize) -> 
     } else {
         num_cpus::get().max(1)
     };
-    let kind = StorageProfile::detect(path)
-        .map(|profile| profile.kind)
-        .unwrap_or(StorageKind::Unknown);
-    let storage_limit = match kind {
-        StorageKind::Nvme => cpu_limit,
-        StorageKind::SataSsd => 8,
-        StorageKind::Hdd => 2,
-        StorageKind::Usb => 4,
-        StorageKind::Network => 4,
-        StorageKind::Unknown => cpu_limit.min(8),
-    };
-    let maximum = files.min(cpu_limit).min(storage_limit).max(1);
-    let initial = match kind {
-        StorageKind::Nvme => 4,
-        StorageKind::SataSsd => 2,
-        StorageKind::Hdd | StorageKind::Usb => 1,
-        StorageKind::Network | StorageKind::Unknown => 2,
-    }
-    .min(maximum)
-    .max(1);
+    let profile = StorageProfile::detect(path).unwrap_or_else(|_| StorageProfile::fallback(path));
+    let policy = profile.io_policy(cpu_limit);
+    let maximum = files.min(cpu_limit).min(policy.maximum).max(1);
+    let initial = policy.initial.min(maximum).max(1);
     (initial, maximum)
 }
 
 #[derive(Clone, Debug)]
 struct StorageProfile {
     root: PathBuf,
-    kind: StorageKind,
+    media: MediaKind,
+    bus: Option<i32>,
+    queued: bool,
+    removable: Option<bool>,
     io_alignment: usize,
     offset_alignment: u64,
     partition_misaligned: bool,
     direct: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IoPolicy {
+    initial: usize,
+    maximum: usize,
+    request_size: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DeviceInfo {
+    bus: Option<i32>,
+    removable: Option<bool>,
+    command_queueing: Option<bool>,
+    vendor: Option<String>,
+    product: Option<String>,
+    revision: Option<String>,
 }
 
 impl StorageProfile {
@@ -93,8 +105,8 @@ impl StorageProfile {
 
         let mut logical = FALLBACK_ALIGNMENT as u32;
         let mut physical = FALLBACK_ALIGNMENT as u32;
-        let mut sector_offset = 0u32;
-        let mut partition_offset = 0u32;
+        let mut sector_offset = None;
+        let mut partition_offset = None;
         if let Ok(file) = std::fs::OpenOptions::new().read(true).open(path) {
             let mut info = FILE_STORAGE_INFO::default();
             let ok = unsafe {
@@ -110,12 +122,13 @@ impl StorageProfile {
                 physical = valid_sector(info.PhysicalBytesPerSectorForPerformance)
                     .or_else(|| valid_sector(info.PhysicalBytesPerSectorForAtomicity))
                     .unwrap_or(physical);
-                sector_offset = info.ByteOffsetForSectorAlignment;
-                partition_offset = info.ByteOffsetForPartitionAlignment;
+                sector_offset = valid_alignment_offset(info.ByteOffsetForSectorAlignment);
+                partition_offset = valid_alignment_offset(info.ByteOffsetForPartitionAlignment);
             }
         }
 
-        let mut bus = None;
+        let mut device = DeviceInfo::default();
+        let mut adapter = None;
         let mut incurs_seek = None;
         let mut trim = None;
         if let Ok(handle) = open_volume(&root) {
@@ -125,9 +138,15 @@ impl StorageProfile {
             ) {
                 logical = valid_sector(alignment.BytesPerLogicalSector).unwrap_or(logical);
                 physical = valid_sector(alignment.BytesPerPhysicalSector).unwrap_or(physical);
-                sector_offset = alignment.BytesOffsetForSectorAlignment;
+                if let Some(offset) =
+                    valid_alignment_offset(alignment.BytesOffsetForSectorAlignment)
+                {
+                    sector_offset = Some(offset);
+                }
             }
-            bus = query_bus_type(handle.0);
+            device = query_device_info(handle.0).unwrap_or_default();
+            adapter =
+                query_property::<STORAGE_ADAPTER_DESCRIPTOR>(handle.0, StorageAdapterProperty);
             incurs_seek = query_property::<DEVICE_SEEK_PENALTY_DESCRIPTOR>(
                 handle.0,
                 StorageDeviceSeekPenaltyProperty,
@@ -137,19 +156,43 @@ impl StorageProfile {
                 .map(|descriptor| descriptor.TrimEnabled);
         }
 
-        let kind = classify_storage(is_network, bus, incurs_seek, trim);
+        let bus = device
+            .bus
+            .or_else(|| adapter.map(|descriptor| i32::from(descriptor.BusType)));
+        let queued = device.command_queueing == Some(true)
+            || adapter.is_some_and(|descriptor| descriptor.CommandQueueing);
+        let virtual_hint = device_looks_virtual(&device);
+        let solid_state_hint = device_looks_solid_state(&device);
+        let media_removable = if bus == Some(BusTypeUsb) && (queued || solid_state_hint) {
+            Some(false)
+        } else {
+            device.removable
+        };
+        let media = classify_media(
+            is_network,
+            bus,
+            media_removable,
+            incurs_seek,
+            trim,
+            virtual_hint,
+            solid_state_hint,
+        );
+        let max_transfer =
+            adapter.and_then(|descriptor| valid_max_transfer(descriptor.MaximumTransferLength));
         let io_alignment = usize::try_from(logical.max(physical))
             .unwrap_or(FALLBACK_ALIGNMENT)
             .max(FALLBACK_ALIGNMENT);
-        let partition_misaligned = physical > 0
-            && (!sector_offset.is_multiple_of(physical)
-                || !partition_offset.is_multiple_of(physical));
-        let direct = kind != StorageKind::Network
-            && !matches!(filesystem.to_ascii_uppercase().as_str(), "CDFS" | "UDF");
+        let partition_misaligned =
+            alignment_is_misaligned(physical, sector_offset, partition_offset);
+        let direct =
+            !is_network && !matches!(filesystem.to_ascii_uppercase().as_str(), "CDFS" | "UDF");
 
         performance::record_storage(format!(
-            "root={} fs={} kind={kind:?} logical_sector={logical} physical_sector={physical} \
-sector_offset={sector_offset} partition_offset={partition_offset} io_alignment={io_alignment} \
+            "root={} fs={} media={media:?} transport={} virtual_hint={virtual_hint} solid_state_hint={solid_state_hint} queued={queued} \
+device_queueing={} adapter_queueing={} removable={} vendor={} product={} revision={} \
+max_transfer={} adapter_bus_version={} adapter_srb_type={} adapter_pio={} adapter_accelerated={} \
+logical_sector={logical} physical_sector={physical} \
+sector_offset={} partition_offset={} io_alignment={io_alignment} \
 partition_misaligned={partition_misaligned} direct_io={direct}",
             root.display(),
             if filesystem.is_empty() {
@@ -157,11 +200,37 @@ partition_misaligned={partition_misaligned} direct_io={direct}",
             } else {
                 &filesystem
             },
+            transport_text(bus, queued),
+            option_bool_text(device.command_queueing),
+            option_bool_text(adapter.map(|descriptor| descriptor.CommandQueueing)),
+            option_bool_text(device.removable),
+            device.vendor.as_deref().unwrap_or("unknown"),
+            device.product.as_deref().unwrap_or("unknown"),
+            device.revision.as_deref().unwrap_or("unknown"),
+            option_usize_text(max_transfer),
+            adapter
+                .map(|descriptor| {
+                    format!(
+                        "{}.{}",
+                        descriptor.BusMajorVersion, descriptor.BusMinorVersion
+                    )
+                })
+                .unwrap_or_else(|| "unknown".to_string()),
+            adapter
+                .map(|descriptor| descriptor.SrbType.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            option_bool_text(adapter.map(|descriptor| descriptor.AdapterUsesPio)),
+            option_bool_text(adapter.map(|descriptor| descriptor.AcceleratedTransfer)),
+            alignment_offset_text(sector_offset),
+            alignment_offset_text(partition_offset),
         ));
 
         Ok(Self {
             root,
-            kind,
+            media,
+            bus,
+            queued,
+            removable: device.removable,
             io_alignment,
             offset_alignment: u64::from(logical),
             partition_misaligned,
@@ -173,34 +242,47 @@ partition_misaligned={partition_misaligned} direct_io={direct}",
         let target = if file_size <= MIN_REQUEST_SIZE as u64 {
             usize::try_from(file_size).unwrap_or(MIN_REQUEST_SIZE)
         } else {
-            match self.kind {
-                StorageKind::Nvme => 2 * 1024 * 1024,
-                StorageKind::SataSsd => 1024 * 1024,
-                StorageKind::Hdd => 4 * 1024 * 1024,
-                StorageKind::Usb => 512 * 1024,
-                StorageKind::Network => 1024 * 1024,
-                StorageKind::Unknown => 1024 * 1024,
-            }
+            self.io_policy(num_cpus::get().max(1)).request_size
         };
         let target = if self.partition_misaligned {
             target.max(1024 * 1024)
         } else {
             target
         };
+        let target = usize::try_from(file_size)
+            .ok()
+            .and_then(|size| round_up(size, self.io_alignment))
+            .map_or(target, |file_request| target.min(file_request));
         let per_lane_budget = memory_budget()
             .checked_div(parallelism.max(1).saturating_mul(2))
             .unwrap_or(MIN_REQUEST_SIZE)
             .clamp(MIN_REQUEST_SIZE, MAX_REQUEST_SIZE);
-        round_up(
-            target.min(per_lane_budget).max(self.io_alignment),
-            self.io_alignment,
-        )
-        .unwrap_or(MAX_REQUEST_SIZE)
-        .min(MAX_REQUEST_SIZE)
+        let target = target.min(per_lane_budget);
+        round_up(target.max(self.io_alignment), self.io_alignment)
+            .unwrap_or(MAX_REQUEST_SIZE)
+            .min(MAX_REQUEST_SIZE)
     }
 
     fn valid_file_offset(&self, offset: u64) -> bool {
         self.offset_alignment != 0 && offset.is_multiple_of(self.offset_alignment)
+    }
+
+    fn io_policy(&self, cpu_limit: usize) -> IoPolicy {
+        io_policy(self.media, self.bus, self.queued, self.removable, cpu_limit)
+    }
+
+    fn fallback(path: &Path) -> Self {
+        Self {
+            root: fallback_root(path),
+            media: MediaKind::Unknown,
+            bus: None,
+            queued: false,
+            removable: None,
+            io_alignment: FALLBACK_ALIGNMENT,
+            offset_alignment: FALLBACK_ALIGNMENT as u64,
+            partition_misaligned: false,
+            direct: true,
+        }
     }
 }
 
@@ -304,16 +386,9 @@ impl WindowsHashWorker {
             return profile.clone();
         }
         let profile = StorageProfile::detect(path).unwrap_or_else(|_| {
-            let profile = StorageProfile {
-                root: fallback_root(path),
-                kind: StorageKind::Unknown,
-                io_alignment: FALLBACK_ALIGNMENT,
-                offset_alignment: FALLBACK_ALIGNMENT as u64,
-                partition_misaligned: false,
-                direct: true,
-            };
+            let profile = StorageProfile::fallback(path);
             performance::record_storage(format!(
-                "root={} fs=unknown kind=Unknown io_alignment={} direct_io=true detection=fallback",
+                "root={} fs=unknown media=Unknown transport=unknown io_alignment={} direct_io=true detection=fallback",
                 profile.root.display(),
                 profile.io_alignment
             ));
@@ -425,7 +500,7 @@ where
             }
             return ReadAttempt {
                 result: Err(anyhow!(
-                    "文件在读取期间缩短: {}（读取到 {} 字节，扫描时为 {} 字节）",
+                    "文件在读取期间缩短: {} (读取到 {} 字节, 扫描时为 {} 字节)",
                     path.display(),
                     processed,
                     expected_size
@@ -593,7 +668,7 @@ impl AlignedBuffer {
             || !request_size.is_multiple_of(required_alignment)
         {
             return Err(anyhow!(
-                "无效的 Direct I/O 请求大小 {request_size}（容量 {}，缓冲区对齐 {}，所需对齐 {required_alignment}）",
+                "无效的 Direct I/O 请求大小 {request_size} (容量 {}, 缓冲区对齐 {}, 所需对齐 {required_alignment})",
                 self.allocation_capacity(),
                 self.alignment
             ));
@@ -652,7 +727,50 @@ fn buffer_growth_capacity(request_size: usize, alignment: usize) -> Option<usize
 }
 
 fn valid_sector(value: u32) -> Option<u32> {
-    (value >= 512 && value.is_power_of_two()).then_some(value)
+    ((512..=MAX_SECTOR_SIZE).contains(&value) && value.is_power_of_two()).then_some(value)
+}
+
+fn valid_alignment_offset(value: u32) -> Option<u32> {
+    (value != u32::MAX).then_some(value)
+}
+
+fn alignment_is_misaligned(
+    physical_sector: u32,
+    sector_offset: Option<u32>,
+    partition_offset: Option<u32>,
+) -> bool {
+    physical_sector > 0
+        && [sector_offset, partition_offset]
+            .into_iter()
+            .flatten()
+            .any(|offset| !offset.is_multiple_of(physical_sector))
+}
+
+fn alignment_offset_text(value: Option<u32>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn valid_max_transfer(value: u32) -> Option<usize> {
+    const MAX_ADAPTER_TRANSFER: u32 = 64 * 1024 * 1024;
+    ((4096..=MAX_ADAPTER_TRANSFER).contains(&value))
+        .then(|| usize::try_from(value).ok())
+        .flatten()
+}
+
+fn option_bool_text(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
+}
+
+fn option_usize_text(value: Option<usize>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn memory_budget() -> usize {
@@ -775,7 +893,7 @@ fn query_property<T: Copy>(handle: HANDLE, property: STORAGE_PROPERTY_ID) -> Opt
     (ok != 0 && returned as usize >= size_of::<T>()).then(|| unsafe { output.assume_init() })
 }
 
-fn query_bus_type(handle: HANDLE) -> Option<i32> {
+fn query_device_info(handle: HANDLE) -> Option<DeviceInfo> {
     let query = STORAGE_PROPERTY_QUERY {
         PropertyId: StorageDeviceProperty,
         QueryType: PropertyStandardQuery,
@@ -799,34 +917,192 @@ fn query_bus_type(handle: HANDLE) -> Option<i32> {
         return None;
     }
     let descriptor = unsafe { &*output.as_ptr().cast::<STORAGE_DEVICE_DESCRIPTOR>() };
-    Some(descriptor.BusType)
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            output.as_ptr().cast::<u8>(),
+            (returned as usize).min(size_of_val(&output)),
+        )
+    };
+    Some(DeviceInfo {
+        bus: Some(descriptor.BusType),
+        removable: Some(descriptor.RemovableMedia),
+        command_queueing: Some(descriptor.CommandQueueing),
+        vendor: descriptor_text(bytes, descriptor.VendorIdOffset),
+        product: descriptor_text(bytes, descriptor.ProductIdOffset),
+        revision: descriptor_text(bytes, descriptor.ProductRevisionOffset),
+    })
 }
 
-fn classify_storage(
+fn descriptor_text(buffer: &[u8], offset: u32) -> Option<String> {
+    let offset = usize::try_from(offset).ok()?;
+    if offset == 0 || offset >= buffer.len() {
+        return None;
+    }
+    let tail = &buffer[offset..];
+    let length = tail
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(tail.len());
+    let value = String::from_utf8_lossy(&tail[..length]).trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+fn device_looks_virtual(device: &DeviceInfo) -> bool {
+    let identity = format!(
+        "{} {}",
+        device.vendor.as_deref().unwrap_or_default(),
+        device.product.as_deref().unwrap_or_default()
+    )
+    .to_ascii_uppercase();
+    [
+        "VIRTUAL",
+        "VBOX",
+        "VMWARE",
+        "QEMU",
+        "VIRTIO",
+        "XEN",
+        "HYPER-V",
+        "MSFT VIRTUAL",
+        "RED HAT",
+        "PARALLELS",
+    ]
+    .iter()
+    .any(|marker| identity.contains(marker))
+}
+
+fn device_looks_solid_state(device: &DeviceInfo) -> bool {
+    let identity = format!(
+        "{} {}",
+        device.vendor.as_deref().unwrap_or_default(),
+        device.product.as_deref().unwrap_or_default()
+    )
+    .to_ascii_uppercase();
+    ["NVME", "SSD", "SOLID STATE", "SOLID-STATE"]
+        .iter()
+        .any(|marker| identity.contains(marker))
+}
+
+fn classify_media(
     network: bool,
     bus: Option<i32>,
+    removable: Option<bool>,
     seek: Option<bool>,
     trim: Option<bool>,
-) -> StorageKind {
+    virtual_hint: bool,
+    solid_state_hint: bool,
+) -> MediaKind {
     if network {
-        return StorageKind::Network;
+        return MediaKind::Network;
+    }
+    if virtual_hint
+        || bus.is_some_and(|value| value == BusTypeVirtual || value == BusTypeFileBackedVirtual)
+    {
+        return match (seek, trim) {
+            (Some(true), _) => MediaKind::Hdd,
+            (_, Some(true)) | (Some(false), _) => MediaKind::Ssd,
+            _ => MediaKind::Virtual,
+        };
     }
     match bus {
-        Some(value) if value == BusTypeNvme => StorageKind::Nvme,
-        Some(value) if value == BusTypeUsb => StorageKind::Usb,
-        Some(value) if (value == BusTypeSata || value == BusTypeScsi) && seek == Some(true) => {
-            StorageKind::Hdd
+        Some(value) if value == BusTypeNvme => MediaKind::Nvme,
+        Some(value) if value == BusTypeSCM => MediaKind::PersistentMemory,
+        Some(value) if value == BusTypeSd || value == BusTypeMmc || value == BusTypeUfs => {
+            MediaKind::Flash
+        }
+        Some(value) if (value == BusTypeiScsi || value == BusTypeFibre) && seek == Some(true) => {
+            MediaKind::Hdd
         }
         Some(value)
-            if (value == BusTypeSata || value == BusTypeScsi)
+            if (value == BusTypeiScsi || value == BusTypeFibre)
                 && (trim == Some(true) || seek == Some(false)) =>
         {
-            StorageKind::SataSsd
+            MediaKind::Ssd
         }
-        _ if seek == Some(true) => StorageKind::Hdd,
-        _ if trim == Some(true) || seek == Some(false) => StorageKind::SataSsd,
-        _ => StorageKind::Unknown,
+        Some(value) if value == BusTypeiScsi || value == BusTypeFibre => MediaKind::Network,
+        Some(value) if value == BusTypeAtapi && trim != Some(true) => MediaKind::Optical,
+        _ if seek == Some(true) => MediaKind::Hdd,
+        _ if solid_state_hint => MediaKind::Ssd,
+        _ if bus == Some(BusTypeUsb) && removable == Some(true) && trim != Some(true) => {
+            MediaKind::Flash
+        }
+        _ if trim == Some(true) || seek == Some(false) => MediaKind::Ssd,
+        _ if bus == Some(BusTypeUsb) && removable == Some(true) => MediaKind::Flash,
+        _ => MediaKind::Unknown,
     }
+}
+
+fn io_policy(
+    media: MediaKind,
+    bus: Option<i32>,
+    queued: bool,
+    removable: Option<bool>,
+    cpu_limit: usize,
+) -> IoPolicy {
+    let cpu_limit = cpu_limit.max(1);
+    let usb = bus == Some(BusTypeUsb);
+    let (initial, maximum, request_size) = match media {
+        MediaKind::Nvme => (4, cpu_limit, 2 * 1024 * 1024),
+        MediaKind::PersistentMemory => (4, cpu_limit, 4 * 1024 * 1024),
+        MediaKind::Ssd if usb && queued => (2, cpu_limit.min(8), 2 * 1024 * 1024),
+        MediaKind::Ssd if usb => (2, cpu_limit.min(4), 1024 * 1024),
+        MediaKind::Ssd
+            if queued
+                && bus.is_some_and(|value| {
+                    value == BusTypeSas
+                        || value == BusTypeScsi
+                        || value == BusTypeRAID
+                        || value == BusTypeSpaces
+                }) =>
+        {
+            (4, cpu_limit.min(8), 2 * 1024 * 1024)
+        }
+        MediaKind::Ssd => (2, cpu_limit.min(8), 1024 * 1024),
+        MediaKind::Hdd => (1, cpu_limit.min(2), 4 * 1024 * 1024),
+        MediaKind::Flash if bus == Some(BusTypeUfs) => (2, cpu_limit.min(4), 1024 * 1024),
+        MediaKind::Flash if usb && queued => (2, cpu_limit.min(4), 1024 * 1024),
+        MediaKind::Flash => (1, cpu_limit.min(2), 512 * 1024),
+        MediaKind::Optical => (1, 1, 256 * 1024),
+        MediaKind::Network => (2, cpu_limit.min(4), 1024 * 1024),
+        MediaKind::Virtual if queued => (2, cpu_limit.min(8), 2 * 1024 * 1024),
+        MediaKind::Virtual => (2, cpu_limit.min(4), 1024 * 1024),
+        MediaKind::Unknown if usb && queued => (2, cpu_limit.min(4), 1024 * 1024),
+        MediaKind::Unknown if usb && removable == Some(true) => (1, cpu_limit.min(2), 512 * 1024),
+        MediaKind::Unknown => (2, cpu_limit.min(8), 1024 * 1024),
+    };
+    IoPolicy {
+        initial: initial.min(maximum.max(1)),
+        maximum: maximum.max(1),
+        request_size,
+    }
+}
+
+fn transport_text(bus: Option<i32>, queued: bool) -> String {
+    let name = match bus {
+        Some(value) if value == BusTypeNvme => "NVMe/PCIe-native-or-tunneled",
+        Some(value) if value == BusTypeSata => "SATA",
+        Some(value) if value == BusTypeAta => "ATA/IDE",
+        Some(value) if value == BusTypeAtapi => "ATAPI",
+        Some(value) if value == BusTypeSas => "SAS",
+        Some(value) if value == BusTypeScsi => "SCSI",
+        Some(value) if value == BusTypeUsb && queued => "USB/queued-UASP-capable",
+        Some(value) if value == BusTypeUsb => "USB/legacy-BOT-or-unreported",
+        Some(value) if value == BusTypeRAID => "RAID",
+        Some(value) if value == BusTypeSpaces => "Storage-Spaces",
+        Some(value) if value == BusTypeiScsi => "iSCSI",
+        Some(value) if value == BusTypeFibre => "Fibre-Channel",
+        Some(value) if value == BusType1394 => "IEEE-1394",
+        Some(value) if value == BusTypeSsa => "SSA",
+        Some(value) if value == BusTypeSd => "SD",
+        Some(value) if value == BusTypeMmc => "MMC",
+        Some(value) if value == BusTypeUfs => "UFS",
+        Some(value) if value == BusTypeSCM => "Persistent-Memory/SCM",
+        Some(value) if value == BusTypeVirtual => "Virtual",
+        Some(value) if value == BusTypeFileBackedVirtual => "File-backed-Virtual",
+        Some(value) if value == BusTypeUnknown => "unknown",
+        Some(_) => "unrecognized",
+        None => "unknown",
+    };
+    name.to_string()
 }
 
 fn wide_null(value: &OsStr) -> Vec<u16> {
@@ -874,6 +1150,171 @@ mod tests {
             buffer_growth_capacity(2 * 1024 * 1024, 4096),
             Some(2 * 1024 * 1024)
         );
+    }
+
+    #[test]
+    fn rejects_invalid_driver_alignment_values() {
+        assert_eq!(valid_sector(0), None);
+        assert_eq!(valid_sector(u32::MAX), None);
+        assert_eq!(valid_sector(2 * 1024 * 1024), None);
+        assert_eq!(valid_sector(4096), Some(4096));
+        assert_eq!(valid_alignment_offset(u32::MAX), None);
+        assert_eq!(valid_alignment_offset(0), Some(0));
+    }
+
+    #[test]
+    fn unknown_offsets_do_not_claim_the_partition_is_misaligned() {
+        assert!(!alignment_is_misaligned(4096, None, None));
+        assert!(!alignment_is_misaligned(4096, Some(0), None));
+        assert!(!alignment_is_misaligned(4096, Some(4096), Some(0)));
+        assert!(alignment_is_misaligned(4096, Some(1), None));
+        assert_eq!(alignment_offset_text(None), "unknown");
+    }
+
+    #[test]
+    fn classifies_transports_by_media_capabilities() {
+        assert_eq!(
+            classify_media(
+                false,
+                Some(BusTypeNvme),
+                Some(false),
+                None,
+                None,
+                false,
+                false,
+            ),
+            MediaKind::Nvme
+        );
+        assert_eq!(
+            classify_media(
+                false,
+                Some(BusTypeUsb),
+                Some(true),
+                Some(false),
+                Some(false),
+                false,
+                false,
+            ),
+            MediaKind::Flash
+        );
+        assert_eq!(
+            classify_media(
+                false,
+                Some(BusTypeUsb),
+                Some(false),
+                Some(false),
+                Some(true),
+                false,
+                false,
+            ),
+            MediaKind::Ssd
+        );
+        assert_eq!(
+            classify_media(
+                false,
+                Some(BusTypeAta),
+                Some(false),
+                Some(true),
+                Some(false),
+                false,
+                false,
+            ),
+            MediaKind::Hdd
+        );
+        assert_eq!(
+            classify_media(
+                false,
+                Some(BusTypeScsi),
+                None,
+                Some(true),
+                None,
+                true,
+                false,
+            ),
+            MediaKind::Hdd
+        );
+        assert_eq!(
+            classify_media(false, Some(BusTypeScsi), None, None, None, true, false,),
+            MediaKind::Virtual
+        );
+        assert_eq!(
+            classify_media(
+                false,
+                Some(BusTypeUsb),
+                Some(false),
+                None,
+                None,
+                false,
+                true,
+            ),
+            MediaKind::Ssd
+        );
+        assert_eq!(
+            classify_media(
+                false,
+                Some(BusTypeUsb),
+                Some(false),
+                Some(true),
+                None,
+                false,
+                true,
+            ),
+            MediaKind::Hdd
+        );
+    }
+
+    #[test]
+    fn policies_preserve_native_defaults_and_split_usb_media() {
+        let nvme = io_policy(MediaKind::Nvme, Some(BusTypeNvme), true, Some(false), 12);
+        assert_eq!(
+            (nvme.initial, nvme.maximum, nvme.request_size),
+            (4, 12, 2 * 1024 * 1024)
+        );
+
+        let flash = io_policy(MediaKind::Flash, Some(BusTypeUsb), false, Some(true), 12);
+        assert_eq!(
+            (flash.initial, flash.maximum, flash.request_size),
+            (1, 2, 512 * 1024)
+        );
+
+        let usb_ssd = io_policy(MediaKind::Ssd, Some(BusTypeUsb), true, Some(false), 12);
+        assert_eq!(
+            (usb_ssd.initial, usb_ssd.maximum, usb_ssd.request_size),
+            (2, 8, 2 * 1024 * 1024)
+        );
+    }
+
+    #[test]
+    fn request_size_respects_file_size_without_hard_capping_to_adapter_srb() {
+        let profile = StorageProfile {
+            root: PathBuf::from("M:\\"),
+            media: MediaKind::Ssd,
+            bus: Some(BusTypeUsb),
+            queued: true,
+            removable: Some(false),
+            io_alignment: 4096,
+            offset_alignment: 512,
+            partition_misaligned: false,
+            direct: true,
+        };
+        assert_eq!(profile.request_size(100_000, 2), 102_400);
+        assert_eq!(profile.request_size(8 * 1024 * 1024, 2), 2 * 1024 * 1024);
+        assert_eq!(valid_max_transfer(u32::MAX), None);
+    }
+
+    #[test]
+    fn recognizes_common_virtual_disk_identities() {
+        let device = DeviceInfo {
+            vendor: Some("Msft".to_string()),
+            product: Some("Virtual Disk".to_string()),
+            ..DeviceInfo::default()
+        };
+        assert!(device_looks_virtual(&device));
+        assert!(!device_looks_virtual(&DeviceInfo {
+            vendor: Some("KINGBANK".to_string()),
+            product: Some("KP320".to_string()),
+            ..DeviceInfo::default()
+        }));
     }
 
     #[test]

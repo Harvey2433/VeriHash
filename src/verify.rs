@@ -298,7 +298,7 @@ fn verify_worker(
                         let expected = &job.expected.get(algorithm)?.digest;
                         (actual != expected).then(|| {
                             format!(
-                                "{}: {} 不匹配（期望 {}，实际 {}）",
+                                "{}: {} 不匹配 (期望 {}, 实际 {})",
                                 job.relative.display(),
                                 algorithm,
                                 expected.to_hex(),

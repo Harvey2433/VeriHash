@@ -49,7 +49,7 @@ impl Theme for CliTheme {
     }
 
     fn format_select_prompt(&self, f: &mut dyn fmt::Write, prompt: &str) -> fmt::Result {
-        write_prompt(f, prompt, "(↑/↓ 选择，回车确认)")
+        write_prompt(f, prompt, "(↑/↓ 选择, 回车确认)")
     }
 
     fn format_select_prompt_selection(
@@ -80,7 +80,7 @@ impl Theme for CliTheme {
     }
 
     fn format_multi_select_prompt(&self, f: &mut dyn fmt::Write, prompt: &str) -> fmt::Result {
-        write_prompt(f, prompt, "(↑/↓ 移动，空格选择，回车确认)")
+        write_prompt(f, prompt, "(↑/↓ 移动, 空格选择, 回车确认)")
     }
 
     fn format_multi_select_prompt_selection(

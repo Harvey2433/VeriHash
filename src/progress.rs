@@ -1,5 +1,6 @@
+use crate::performance;
 use console::style;
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use indicatif::{ProgressBar, ProgressState, ProgressStyle};
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -10,6 +11,8 @@ use std::time::{Duration, Instant};
 
 const SPEED_WINDOW: Duration = Duration::from_millis(750);
 const SPEED_SAMPLE_INTERVAL: Duration = Duration::from_millis(80);
+const COMPLETION_FRAME: Duration = Duration::from_millis(16);
+const COMPLETION_DRAW_BATCH: usize = 256;
 
 #[derive(Debug)]
 pub enum ProgressEvent {
@@ -32,7 +35,7 @@ pub struct ProgressRenderer {
 
 impl ProgressRenderer {
     pub fn start(total_bytes: u64, counters: Arc<ProgressCounters>) -> Self {
-        let (sender, receiver) = bounded(8192);
+        let (sender, receiver) = unbounded();
         let handle = thread::spawn(move || render_loop(total_bytes, counters, receiver));
         Self {
             sender,
@@ -70,22 +73,66 @@ fn render_loop(
     overall.set_message(parallel_message(0));
     overall.enable_steady_tick(Duration::from_millis(80));
     let mut speed = ShortWindowRate::new(SPEED_WINDOW, SPEED_SAMPLE_INTERVAL);
+    let mut completion_lines = 0u64;
+    let mut completion_draws = 0u64;
+    let mut largest_draw_batch = 0u64;
+    let mut peak_pending_completions = 0u64;
 
     loop {
+        let mut stop = false;
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(ProgressEvent::Finished { path, success }) => {
-                overall.println(completion_line(path, success));
+                peak_pending_completions = peak_pending_completions.max(receiver.len() as u64 + 1);
+                let mut lines = completion_line(path, success);
+                let mut batch_size = 1u64;
+                let deadline = Instant::now() + COMPLETION_FRAME;
+                for _ in 1..COMPLETION_DRAW_BATCH {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match receiver.recv_timeout(remaining) {
+                        Ok(ProgressEvent::Finished { path, success }) => {
+                            lines.push('\n');
+                            lines.push_str(&completion_line(path, success));
+                            batch_size += 1;
+                        }
+                        Ok(ProgressEvent::Stop) => {
+                            stop = true;
+                            break;
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            stop = true;
+                            break;
+                        }
+                    }
+                }
+                overall.println(lines);
+                completion_lines += batch_size;
+                completion_draws += 1;
+                largest_draw_batch = largest_draw_batch.max(batch_size);
                 overall.tick();
             }
-            Ok(ProgressEvent::Stop) => break,
+            Ok(ProgressEvent::Stop) => stop = true,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => stop = true,
         }
         let bytes = counters.bytes.load(Ordering::Relaxed).min(total);
         window_rate.store(speed.observe(Instant::now(), bytes), Ordering::Relaxed);
         overall.set_position(bytes);
         overall.set_message(parallel_message(counters.active.load(Ordering::Relaxed)));
+        if stop {
+            break;
+        }
     }
+
+    performance::record_progress_rendering(
+        completion_lines,
+        completion_draws,
+        largest_draw_batch,
+        peak_pending_completions,
+    );
 
     overall.disable_steady_tick();
     overall.set_prefix(

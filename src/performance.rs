@@ -117,6 +117,10 @@ struct Metrics {
     files_started: AtomicU64,
     files_succeeded: AtomicU64,
     files_failed: AtomicU64,
+    completion_lines: AtomicU64,
+    completion_draws: AtomicU64,
+    largest_completion_batch: AtomicU64,
+    peak_pending_completions: AtomicU64,
     direct_open_ops: AtomicU64,
     cached_open_ops: AtomicU64,
     open_errors: AtomicU64,
@@ -171,6 +175,10 @@ impl Metrics {
             files_started: AtomicU64::new(0),
             files_succeeded: AtomicU64::new(0),
             files_failed: AtomicU64::new(0),
+            completion_lines: AtomicU64::new(0),
+            completion_draws: AtomicU64::new(0),
+            largest_completion_batch: AtomicU64::new(0),
+            peak_pending_completions: AtomicU64::new(0),
             direct_open_ops: AtomicU64::new(0),
             cached_open_ops: AtomicU64::new(0),
             open_errors: AtomicU64::new(0),
@@ -304,6 +312,19 @@ pub fn record_file_totals(started: u64, succeeded: u64, failed: u64) {
         metrics.files_started.store(started, Ordering::Relaxed);
         metrics.files_succeeded.store(succeeded, Ordering::Relaxed);
         metrics.files_failed.store(failed, Ordering::Relaxed);
+    }
+}
+
+pub fn record_progress_rendering(lines: u64, draws: u64, largest_batch: u64, peak_pending: u64) {
+    if let Some(metrics) = metrics() {
+        metrics.completion_lines.store(lines, Ordering::Relaxed);
+        metrics.completion_draws.store(draws, Ordering::Relaxed);
+        metrics
+            .largest_completion_batch
+            .store(largest_batch, Ordering::Relaxed);
+        metrics
+            .peak_pending_completions
+            .store(peak_pending, Ordering::Relaxed);
     }
 }
 
@@ -618,6 +639,20 @@ impl Metrics {
         line_atomic(&mut report, "files_started", &self.files_started);
         line_atomic(&mut report, "files_succeeded", &self.files_succeeded);
         line_atomic(&mut report, "files_failed", &self.files_failed);
+
+        report.push_str("\nProgress rendering\n------------------\n");
+        line_atomic(&mut report, "completion_lines", &self.completion_lines);
+        line_atomic(&mut report, "completion_draws", &self.completion_draws);
+        line_atomic(
+            &mut report,
+            "largest_completion_batch",
+            &self.largest_completion_batch,
+        );
+        line_atomic(
+            &mut report,
+            "peak_pending_completions",
+            &self.peak_pending_completions,
+        );
 
         report.push_str("\nStorage\n-------\n");
         let storage = self

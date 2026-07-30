@@ -109,7 +109,7 @@ impl Algorithm {
             && algorithm.digest_len() * 2 != hex_len
         {
             bail!(
-                "{} 摘要长度应为 {} 个十六进制字符，实际为 {hex_len}",
+                "{} 摘要长度应为 {} 个十六进制字符, 实际为 {hex_len}",
                 algorithm.label(),
                 algorithm.digest_len() * 2
             );
@@ -125,7 +125,7 @@ fn parse_blake2_len(bits: &str, max_bytes: u8, family: &str) -> Result<u8> {
     let bits: u16 = bits.parse()?;
     if bits == 0 || !bits.is_multiple_of(8) || bits > u16::from(max_bytes) * 8 {
         bail!(
-            "{family} 输出长度必须为 8 的倍数，且不超过 {} 位",
+            "{family} 输出长度必须为 8 的倍数, 且不超过 {} 位",
             max_bytes as u16 * 8
         );
     }

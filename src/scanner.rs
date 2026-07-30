@@ -71,7 +71,7 @@ impl InputSpec {
                 base: std::env::current_dir()?,
             });
         }
-        bail!("路径不存在，且不是有效通配符: {raw}")
+        bail!("路径不存在, 且不是有效通配符: {raw}")
     }
 
     pub fn describe(&self) -> &str {
