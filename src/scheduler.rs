@@ -1,11 +1,12 @@
 use crate::algorithm::Algorithm;
-use crate::concurrency::{AdaptiveGate, AdaptiveTuner};
-use crate::hashing::{HashWorker, parallelism_limits};
-use crate::progress::{ProgressCounters, ProgressEvent, ProgressRenderer};
-use crate::scanner::{FileEntry, InputSpec, ScanSummary};
+use crate::concurrency::{AdaptiveGate, AdaptiveTuner, FixedGate};
+use crate::hashing::{HashWorker, bulk_lane_policy, parallelism_limits};
+use crate::progress::{ProgressCounters, ProgressEvent, ProgressRenderer, ProgressResult};
+use crate::scanner::{FileEntry, ScanPlan};
 use crate::spool::{ComputedFile, ResultSpool, SpoolWriter};
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, bounded};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -17,14 +18,23 @@ const BATCH_BYTE_LIMIT: u64 = 8 * 1024 * 1024;
 const PROGRESS_BYTE_FLUSH: u64 = 8 * 1024 * 1024;
 const PROGRESS_TIME_FLUSH: Duration = Duration::from_millis(50);
 
-#[derive(Debug)]
 struct TaskBatch {
     files: Vec<FileEntry>,
+    bulk_gate: Option<Arc<FixedGate>>,
 }
 
 enum WorkResult {
     Success(ComputedFile),
     Failure(String),
+}
+
+struct WorkerContext {
+    results: Sender<WorkResult>,
+    events: Sender<ProgressEvent>,
+    counters: Arc<ProgressCounters>,
+    algorithms: Vec<Algorithm>,
+    parallelism: usize,
+    gate: Arc<AdaptiveGate>,
 }
 
 pub struct ComputeOutcome {
@@ -34,13 +44,18 @@ pub struct ComputeOutcome {
 }
 
 pub fn compute(
-    input: &InputSpec,
-    summary: &ScanSummary,
+    plan: &mut ScanPlan,
+    probe_path: &std::path::Path,
     algorithms: &[Algorithm],
 ) -> Result<ComputeOutcome> {
+    let summary = plan.summary().clone();
     let file_count = usize::try_from(summary.files).unwrap_or(usize::MAX);
-    let (initial_parallelism, worker_count) =
-        parallelism_limits(input.probe_path(), file_count, algorithms.len());
+    let (initial_parallelism, worker_count) = parallelism_limits(
+        probe_path,
+        file_count,
+        algorithms.len(),
+        Some(&summary.workload),
+    );
     let counters = Arc::new(ProgressCounters::default());
     let gate = Arc::new(AdaptiveGate::new(initial_parallelism, worker_count));
     let tuner = AdaptiveTuner::start(Arc::clone(&gate), Arc::clone(&counters));
@@ -50,6 +65,9 @@ pub fn compute(
     let (result_sender, result_receiver) = bounded::<WorkResult>(worker_count * 2);
     let algorithms = algorithms.to_vec();
     let keep_display_results = summary.files <= 10;
+    crate::performance::record_storage(
+        "scheduler_order=per-volume-discovery-order small_batching=adjacent-only".to_string(),
+    );
 
     let writer_algorithms = algorithms.clone();
     let writer_handle = thread::spawn(move || {
@@ -67,23 +85,39 @@ pub fn compute(
             scope.spawn(move || {
                 worker_loop(
                     tasks,
-                    results,
-                    events,
-                    counters,
-                    algorithms,
-                    worker_count,
-                    gate,
+                    WorkerContext {
+                        results,
+                        events,
+                        counters,
+                        algorithms,
+                        parallelism: worker_count,
+                        gate,
+                    },
                 )
             });
         }
         drop(task_receiver);
         let mut batch = Vec::new();
         let mut batch_bytes = 0u64;
-        input.visit_files(|file| {
+        let mut volume_gates = HashMap::<std::path::PathBuf, Arc<FixedGate>>::new();
+        plan.for_each_entry(|file| {
             if file.size >= SMALL_FILE_LIMIT {
                 flush_batch(&task_sender, &mut batch, &mut batch_bytes)?;
+                let (volume, limit) = bulk_lane_policy(&file.path, algorithms.len());
+                let effective_limit = limit.min(worker_count);
+                let bulk_gate =
+                    Arc::clone(volume_gates.entry(volume.clone()).or_insert_with(|| {
+                        crate::performance::record_storage(format!(
+                            "scheduler_root={} bulk_stream_limit={effective_limit}",
+                            volume.display()
+                        ));
+                        Arc::new(FixedGate::new(effective_limit))
+                    }));
                 task_sender
-                    .send(TaskBatch { files: vec![file] })
+                    .send(TaskBatch {
+                        files: vec![file],
+                        bulk_gate: Some(bulk_gate),
+                    })
                     .map_err(|_| anyhow!("任务队列提前关闭"))?;
                 return Ok(());
             }
@@ -119,82 +153,81 @@ fn flush_batch(
     let files = std::mem::take(batch);
     *batch_bytes = 0;
     sender
-        .send(TaskBatch { files })
+        .send(TaskBatch {
+            files,
+            bulk_gate: None,
+        })
         .map_err(|_| anyhow!("任务队列提前关闭"))?;
     Ok(())
 }
 
-fn worker_loop(
-    tasks: Receiver<TaskBatch>,
-    results: Sender<WorkResult>,
-    events: Sender<ProgressEvent>,
-    counters: Arc<ProgressCounters>,
-    algorithms: Vec<Algorithm>,
-    parallelism: usize,
-    gate: Arc<AdaptiveGate>,
-) {
-    let mut hash_worker = HashWorker::new(parallelism).map_err(|error| format!("{error:#}"));
+fn worker_loop(tasks: Receiver<TaskBatch>, context: WorkerContext) {
+    let mut hash_worker =
+        HashWorker::new(context.parallelism).map_err(|error| format!("{error:#}"));
     let mut pending_bytes = 0u64;
     let mut last_flush = Instant::now();
     for batch in tasks {
         for file in batch.files {
-            let _permit = gate.acquire();
+            let _bulk_permit = batch.bulk_gate.as_ref().map(|gate| gate.acquire());
+            let _permit = context.gate.acquire();
             if let Ok(worker) = &mut hash_worker {
-                worker.set_parallelism(gate.target());
+                worker.set_parallelism(context.gate.target());
             }
             let display_path = file.relative.display().to_string();
-            counters.active.fetch_add(1, Ordering::Relaxed);
+            context.counters.active.fetch_add(1, Ordering::Relaxed);
             let hashed = match &mut hash_worker {
-                Ok(worker) => worker.hash_file(&file.path, file.size, &algorithms, |bytes| {
-                    pending_bytes += bytes;
-                    if pending_bytes >= PROGRESS_BYTE_FLUSH
-                        || last_flush.elapsed() >= PROGRESS_TIME_FLUSH
-                    {
-                        counters.bytes.fetch_add(pending_bytes, Ordering::Relaxed);
-                        pending_bytes = 0;
-                        last_flush = Instant::now();
-                    }
-                }),
+                Ok(worker) => {
+                    worker.hash_file(&file.path, file.size, &context.algorithms, |bytes| {
+                        pending_bytes += bytes;
+                        if pending_bytes >= PROGRESS_BYTE_FLUSH
+                            || last_flush.elapsed() >= PROGRESS_TIME_FLUSH
+                        {
+                            context
+                                .counters
+                                .bytes
+                                .fetch_add(pending_bytes, Ordering::Relaxed);
+                            pending_bytes = 0;
+                            last_flush = Instant::now();
+                        }
+                    })
+                }
                 Err(error) => Err(anyhow!(error.clone())),
             };
             if pending_bytes > 0 {
-                counters.bytes.fetch_add(pending_bytes, Ordering::Relaxed);
+                context
+                    .counters
+                    .bytes
+                    .fetch_add(pending_bytes, Ordering::Relaxed);
                 pending_bytes = 0;
                 last_flush = Instant::now();
             }
-            counters.files.fetch_add(1, Ordering::Relaxed);
+            context.counters.files.fetch_add(1, Ordering::Relaxed);
             let success = match hashed {
                 Ok(hashes) => {
-                    let changed = std::fs::metadata(&file.path)
-                        .map(|metadata| metadata.len() != file.size)
-                        .unwrap_or(true);
-                    if changed {
-                        counters.failed.fetch_add(1, Ordering::Relaxed);
-                        let _ = results.send(WorkResult::Failure(format!(
-                            "文件在计算期间发生变化: {}",
-                            file.path.display()
-                        )));
-                        false
-                    } else {
-                        let _ = results.send(WorkResult::Success(ComputedFile {
-                            relative: file.relative,
-                            size: file.size,
-                            hashes,
-                        }));
-                        true
-                    }
+                    let _ = context.results.send(WorkResult::Success(ComputedFile {
+                        relative: file.relative,
+                        size: file.size,
+                        hashes,
+                    }));
+                    true
                 }
                 Err(error) => {
-                    counters.failed.fetch_add(1, Ordering::Relaxed);
-                    let _ = results.send(WorkResult::Failure(format!("{error:#}")));
+                    context.counters.failed.fetch_add(1, Ordering::Relaxed);
+                    let _ = context
+                        .results
+                        .send(WorkResult::Failure(format!("{error:#}")));
                     false
                 }
             };
-            let _ = events.send(ProgressEvent::Finished {
+            let _ = context.events.send(ProgressEvent::Finished {
                 path: display_path,
-                success,
+                result: if success {
+                    ProgressResult::Complete
+                } else {
+                    ProgressResult::Failed
+                },
             });
-            counters.active.fetch_sub(1, Ordering::Relaxed);
+            context.counters.active.fetch_sub(1, Ordering::Relaxed);
         }
     }
 }
@@ -230,6 +263,7 @@ fn collect_results(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::InputSpec;
     use std::fs;
 
     #[test]
@@ -238,8 +272,13 @@ mod tests {
         fs::write(directory.path().join("empty"), []).unwrap();
         fs::write(directory.path().join("hello"), b"hello").unwrap();
         let input = InputSpec::parse(directory.path().to_str().unwrap()).unwrap();
-        let summary = input.inspect().unwrap();
-        let mut outcome = compute(&input, &summary, &[Algorithm::Md5, Algorithm::Sha256]).unwrap();
+        let mut plan = input.plan().unwrap();
+        let mut outcome = compute(
+            &mut plan,
+            input.probe_path(),
+            &[Algorithm::Md5, Algorithm::Sha256],
+        )
+        .unwrap();
         assert!(outcome.failures.is_empty());
         assert_eq!(outcome.display_results.len(), 2);
         let mut records = 0;
@@ -251,5 +290,76 @@ mod tests {
             })
             .unwrap();
         assert_eq!(records, 2);
+    }
+
+    #[test]
+    #[ignore = "small-file scheduler benchmark"]
+    fn benchmarks_ten_thousand_small_files() {
+        const FILES: usize = 10_000;
+        let directory = tempfile::tempdir().unwrap();
+        let contents = [0x5Au8; 4096];
+        for index in 0..FILES {
+            fs::write(directory.path().join(format!("{index:05}.bin")), contents).unwrap();
+        }
+        let input = InputSpec::parse(directory.path().to_str().unwrap()).unwrap();
+        let scan_started = Instant::now();
+        let mut plan = input.plan().unwrap();
+        let scan = scan_started.elapsed();
+        let compute_started = Instant::now();
+        let outcome = compute(&mut plan, input.probe_path(), &[Algorithm::Md5]).unwrap();
+        let compute = compute_started.elapsed();
+        assert!(outcome.failures.is_empty());
+        eprintln!(
+            "small_file_scan_seconds={:.6} small_file_compute_seconds={:.6} total_seconds={:.6}",
+            scan.as_secs_f64(),
+            compute.as_secs_f64(),
+            (scan + compute).as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[ignore = "mixed large/small scheduler benchmark"]
+    fn benchmarks_mixed_large_and_small_files() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..4 {
+            fs::File::create(directory.path().join(format!("large-{index}.bin")))
+                .unwrap()
+                .set_len(512 * 1024 * 1024)
+                .unwrap();
+        }
+        let contents = [0xA5u8; 4096];
+        for index in 0..5_000 {
+            fs::write(
+                directory.path().join(format!("small-{index:05}.bin")),
+                contents,
+            )
+            .unwrap();
+        }
+        let input = InputSpec::parse(directory.path().to_str().unwrap()).unwrap();
+        let started = Instant::now();
+        let mut plan = input.plan().unwrap();
+        let outcome = compute(&mut plan, input.probe_path(), &[Algorithm::Md5]).unwrap();
+        let elapsed = started.elapsed();
+        assert!(outcome.failures.is_empty());
+        eprintln!("mixed_total_seconds={:.6}", elapsed.as_secs_f64());
+    }
+
+    #[test]
+    #[ignore = "parallel large-file scheduler benchmark"]
+    fn benchmarks_twelve_parallel_large_files() {
+        let directory = tempfile::tempdir().unwrap();
+        for index in 0..12 {
+            fs::File::create(directory.path().join(format!("large-{index:02}.bin")))
+                .unwrap()
+                .set_len(256 * 1024 * 1024)
+                .unwrap();
+        }
+        let input = InputSpec::parse(directory.path().to_str().unwrap()).unwrap();
+        let started = Instant::now();
+        let mut plan = input.plan().unwrap();
+        let outcome = compute(&mut plan, input.probe_path(), &[Algorithm::Md5]).unwrap();
+        let elapsed = started.elapsed();
+        assert!(outcome.failures.is_empty());
+        eprintln!("parallel_large_total_seconds={:.6}", elapsed.as_secs_f64());
     }
 }

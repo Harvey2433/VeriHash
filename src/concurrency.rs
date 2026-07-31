@@ -11,6 +11,51 @@ pub struct AdaptiveGate {
     maximum: usize,
 }
 
+pub struct FixedGate {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+impl FixedGate {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            active: AtomicUsize::new(0),
+            limit: limit.max(1),
+        }
+    }
+
+    pub fn acquire(&self) -> FixedPermit<'_> {
+        let mut spins = 0usize;
+        loop {
+            let active = self.active.load(Ordering::Relaxed);
+            if active < self.limit
+                && self
+                    .active
+                    .compare_exchange_weak(active, active + 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return FixedPermit { gate: self };
+            }
+            if spins < 32 {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                thread::sleep(Duration::from_micros(100));
+            }
+        }
+    }
+}
+
+pub struct FixedPermit<'a> {
+    gate: &'a FixedGate,
+}
+
+impl Drop for FixedPermit<'_> {
+    fn drop(&mut self) {
+        self.gate.active.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl AdaptiveGate {
     pub fn new(initial: usize, maximum: usize) -> Self {
         let maximum = maximum.max(1);
@@ -160,5 +205,15 @@ mod tests {
         assert_eq!(gate.active(), 1);
         drop(permit);
         assert_eq!(gate.active(), 0);
+    }
+
+    #[test]
+    fn fixed_gate_tracks_active_work() {
+        let gate = FixedGate::new(2);
+        let first = gate.acquire();
+        let second = gate.acquire();
+        assert_eq!(gate.active.load(Ordering::Relaxed), 2);
+        drop((first, second));
+        assert_eq!(gate.active.load(Ordering::Relaxed), 0);
     }
 }

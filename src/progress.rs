@@ -16,8 +16,20 @@ const COMPLETION_DRAW_BATCH: usize = 256;
 
 #[derive(Debug)]
 pub enum ProgressEvent {
-    Finished { path: String, success: bool },
+    Finished {
+        path: String,
+        result: ProgressResult,
+    },
     Stop,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgressResult {
+    Complete,
+    Failed,
+    Verified,
+    Mismatch,
+    Error,
 }
 
 #[derive(Default)]
@@ -81,9 +93,9 @@ fn render_loop(
     loop {
         let mut stop = false;
         match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(ProgressEvent::Finished { path, success }) => {
+            Ok(ProgressEvent::Finished { path, result }) => {
                 peak_pending_completions = peak_pending_completions.max(receiver.len() as u64 + 1);
-                let mut lines = completion_line(path, success);
+                let mut lines = completion_line(path, result);
                 let mut batch_size = 1u64;
                 let deadline = Instant::now() + COMPLETION_FRAME;
                 for _ in 1..COMPLETION_DRAW_BATCH {
@@ -92,9 +104,9 @@ fn render_loop(
                         break;
                     }
                     match receiver.recv_timeout(remaining) {
-                        Ok(ProgressEvent::Finished { path, success }) => {
+                        Ok(ProgressEvent::Finished { path, result }) => {
                             lines.push('\n');
-                            lines.push_str(&completion_line(path, success));
+                            lines.push_str(&completion_line(path, result));
                             batch_size += 1;
                         }
                         Ok(ProgressEvent::Stop) => {
@@ -151,12 +163,15 @@ fn render_loop(
     }
 }
 
-fn completion_line(path: String, success: bool) -> String {
-    let label = if success {
-        style(format!("{:>12}", "Complete")).green().bold()
-    } else {
-        style(format!("{:>12}", "Failed")).red().bold()
+fn completion_line(path: String, result: ProgressResult) -> String {
+    let (text, label_style) = match result {
+        ProgressResult::Complete => ("Complete", console::Style::new().green().bold()),
+        ProgressResult::Failed => ("Failed", console::Style::new().red().bold()),
+        ProgressResult::Verified => ("Verified", console::Style::new().green().bold()),
+        ProgressResult::Mismatch => ("Mismatch", console::Style::new().red().bold()),
+        ProgressResult::Error => ("Error", console::Style::new().red().bold()),
     };
+    let label = label_style.apply_to(format!("{text:>12}"));
     format!("{label} {}", style(path).white())
 }
 

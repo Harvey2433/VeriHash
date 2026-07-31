@@ -2,11 +2,12 @@ use crate::algorithm::{Algorithm, DigestValue};
 use anyhow::{Context, Result, bail};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug)]
 pub struct ManifestEntry {
     pub target: PathBuf,
+    pub relative_target: Option<PathBuf>,
     pub hashes: Vec<(Algorithm, DigestValue)>,
 }
 
@@ -70,6 +71,13 @@ pub fn detect(path: &Path) -> Result<Option<Manifest>> {
         return parse_tagged(path).map(Some);
     }
     if let Some(algorithm) = algorithm_from_filename(path) {
+        return if first_line_matches_gnu(&first, &algorithm) {
+            parse_gnu(path, &algorithm).map(Some)
+        } else {
+            Ok(None)
+        };
+    }
+    if let Some(algorithm) = algorithm_from_gnu_line(&first) {
         return parse_gnu(path, &algorithm).map(Some);
     }
     Ok(None)
@@ -111,7 +119,7 @@ fn parse_blazehash(path: &Path) -> Result<Manifest> {
         if record.len() != algorithms.len() + 2 {
             bail!("BlazeHash 记录列数不匹配");
         }
-        let target = resolve_target(path, &record[record.len() - 1]);
+        let (target, relative_target) = resolve_target(path, &record[record.len() - 1]);
         let mut hashes = Vec::with_capacity(algorithms.len());
         for (index, algorithm) in algorithms.iter().enumerate() {
             hashes.push((
@@ -119,7 +127,11 @@ fn parse_blazehash(path: &Path) -> Result<Manifest> {
                 DigestValue::from_hex(&record[index + 1], algorithm.digest_len())?,
             ));
         }
-        entries.push(ManifestEntry { target, hashes });
+        entries.push(ManifestEntry {
+            target,
+            relative_target,
+            hashes,
+        });
     }
     Ok(Manifest {
         source: path.to_path_buf(),
@@ -144,13 +156,14 @@ fn parse_tagged(path: &Path) -> Result<Manifest> {
             .context("VeriHash 行缺少文件路径")?;
         let digest = &rest[..split];
         let target_text = rest[split..].trim_start();
-        let target = resolve_target(path, target_text);
+        let (target, relative_target) = resolve_target(path, target_text);
         let digest = DigestValue::from_hex(digest, algorithm.digest_len())?;
         if let Some(entry) = entries.iter_mut().find(|entry| entry.target == target) {
             entry.hashes.push((algorithm, digest));
         } else {
             entries.push(ManifestEntry {
                 target,
+                relative_target,
                 hashes: vec![(algorithm, digest)],
             });
         }
@@ -172,8 +185,11 @@ fn parse_tagged_prefix(line: &str) -> Option<(Algorithm, &str)> {
 fn parse_gnu(path: &Path, algorithm: &Algorithm) -> Result<Manifest> {
     let reader = BufReader::new(File::open(path)?);
     let mut entries = Vec::new();
-    for line in reader.lines() {
+    for (index, line) in reader.lines().enumerate() {
         let mut line = line?;
+        if index == 0 {
+            line = line.trim_start_matches('\u{feff}').to_string();
+        }
         if line.trim().is_empty() {
             continue;
         }
@@ -197,8 +213,10 @@ fn parse_gnu(path: &Path, algorithm: &Algorithm) -> Result<Manifest> {
         } else {
             filename.to_string()
         };
+        let (target, relative_target) = resolve_target(path, &filename);
         entries.push(ManifestEntry {
-            target: resolve_target(path, &filename),
+            target,
+            relative_target,
             hashes: vec![(algorithm.clone(), digest)],
         });
     }
@@ -211,10 +229,12 @@ fn parse_gnu(path: &Path, algorithm: &Algorithm) -> Result<Manifest> {
 fn parse_sidecar(path: &Path, algorithm: &Algorithm, digest: &str) -> Result<Manifest> {
     let digest = DigestValue::from_hex(digest.trim(), algorithm.digest_len())?;
     let target = path.with_extension("");
+    let relative_target = target.file_name().map(PathBuf::from);
     Ok(Manifest {
         source: path.to_path_buf(),
         entries: vec![ManifestEntry {
             target,
+            relative_target,
             hashes: vec![(algorithm.clone(), digest)],
         }],
     })
@@ -238,16 +258,79 @@ fn unescape_gnu_path(value: &str) -> Result<String> {
     Ok(output)
 }
 
-fn resolve_target(manifest: &Path, target: &str) -> PathBuf {
+fn resolve_target(manifest: &Path, target: &str) -> (PathBuf, Option<PathBuf>) {
     let target = PathBuf::from(target.replace('/', std::path::MAIN_SEPARATOR_STR));
     if target.is_absolute() {
-        target
+        (normalize_path(&target), None)
     } else {
-        manifest
+        let resolved = manifest
             .parent()
             .unwrap_or_else(|| Path::new("."))
-            .join(target)
+            .join(&target);
+        (normalize_path(&resolved), Some(target))
     }
+}
+
+pub(crate) fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    normalized.components().next_back(),
+                    Some(Component::RootDir)
+                ) {
+                    normalized.pop();
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn algorithm_from_gnu_line(line: &str) -> Option<Algorithm> {
+    let digest = gnu_digest_with_filename(line)?;
+    match digest.len() {
+        32 => Some(Algorithm::Md5),
+        56 => Some(Algorithm::Sha224),
+        64 => Some(Algorithm::Sha256),
+        96 => Some(Algorithm::Sha384),
+        128 => Some(Algorithm::Sha512),
+        _ => None,
+    }
+}
+
+fn first_line_matches_gnu(line: &str, algorithm: &Algorithm) -> bool {
+    let line = line.trim_start_matches('\u{feff}');
+    let line = line.strip_prefix('\\').unwrap_or(line);
+    let digest = match line.find(' ') {
+        Some(separator) => {
+            let remainder = &line[separator + 1..];
+            if !matches!(remainder.as_bytes().first(), Some(b' ' | b'*')) {
+                return false;
+            }
+            &line[..separator]
+        }
+        None => line.trim_end_matches(['\r', '\n']),
+    };
+    DigestValue::from_hex(digest, algorithm.digest_len()).is_ok()
+}
+
+fn gnu_digest_with_filename(line: &str) -> Option<&str> {
+    let line = line.trim_start_matches('\u{feff}');
+    let line = line.strip_prefix('\\').unwrap_or(line);
+    let separator = line.find(' ')?;
+    let digest = &line[..separator];
+    if digest.is_empty() || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let remainder = &line[separator + 1..];
+    if !matches!(remainder.as_bytes().first(), Some(b' ' | b'*')) {
+        return None;
+    }
+    Some(digest)
 }
 
 fn algorithm_from_filename(path: &Path) -> Option<Algorithm> {
@@ -289,6 +372,7 @@ fn algorithm_from_filename(path: &Path) -> Option<Algorithm> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
 
     #[test]
@@ -304,5 +388,40 @@ mod tests {
         assert_eq!(manifest.entries.len(), 1);
         assert_eq!(manifest.entries[0].hashes[0].0, Algorithm::Sha256);
         assert_eq!(manifest.entries[0].target, directory.path().join("empty"));
+    }
+
+    #[test]
+    fn detects_generic_gnu_manifest_from_digest_length() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("checksums.txt");
+        writeln!(
+            File::create(&path).unwrap(),
+            "\u{feff}e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 *./empty"
+        )
+        .unwrap();
+        let manifest = detect(&path).unwrap().unwrap();
+        assert_eq!(manifest.entries[0].hashes[0].0, Algorithm::Sha256);
+        assert_eq!(manifest.entries[0].target, directory.path().join("empty"));
+    }
+
+    #[test]
+    fn normalizes_parent_components_in_manifest_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("sha256sums");
+        writeln!(
+            File::create(&path).unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 *nested/../empty"
+        )
+        .unwrap();
+        let manifest = detect(&path).unwrap().unwrap();
+        assert_eq!(manifest.entries[0].target, directory.path().join("empty"));
+    }
+
+    #[test]
+    fn ignores_filename_candidates_with_non_manifest_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notes.md5");
+        fs::write(&path, "this is not an MD5 sidecar\n").unwrap();
+        assert!(detect(&path).unwrap().is_none());
     }
 }

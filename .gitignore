@@ -17,6 +17,7 @@ target
 report/
 reports/
 verihash-performance-*.txt
+verification-report*.txt
 
 # VeriHash generated checksum manifests
 checksums.*

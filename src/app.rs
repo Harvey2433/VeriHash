@@ -1,4 +1,4 @@
-use crate::algorithm::{Algorithm, DigestValue};
+use crate::algorithm::Algorithm;
 use crate::format::{OutputFormat, output_paths, write_outputs};
 use crate::interaction::CliTheme;
 use crate::performance;
@@ -10,7 +10,7 @@ use anyhow::{Result, bail};
 use console::{Style, Term, style};
 use dialoguer::{Input, MultiSelect, Select};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy)]
@@ -97,9 +97,10 @@ fn run_compute(theme: &CliTheme) -> Result<()> {
     let input = prompt_input(theme)?;
     let spinner = scanning_spinner(&input);
     let scan_started = Instant::now();
-    let summary = input.inspect();
+    let plan = input.plan();
     spinner.finish_and_clear();
-    let summary = summary?;
+    let mut plan = plan?;
+    let summary = plan.summary().clone();
     performance::record_scan(scan_started.elapsed(), &summary);
     if summary.files == 0 {
         bail!("没有匹配到可处理文件");
@@ -127,7 +128,7 @@ fn run_compute(theme: &CliTheme) -> Result<()> {
 
     performance::begin_processing();
     let processing_started = Instant::now();
-    let outcome = scheduler::compute(&input, &summary, &algorithms);
+    let outcome = scheduler::compute(&mut plan, input.probe_path(), &algorithms);
     performance::record_processing(processing_started.elapsed());
     let mut outcome = outcome?;
     let failed_files = outcome.failures.len() as u64;
@@ -161,7 +162,7 @@ fn run_compute(theme: &CliTheme) -> Result<()> {
         .with_prompt("输出目录")
         .default(".".to_string())
         .interact_text()?;
-    let destination = PathBuf::from(destination);
+    let destination = PathBuf::from(sanitize_path_input(&destination));
     let existing = output_paths(outcome.spool.algorithms(), &formats, &destination)
         .into_iter()
         .filter(|path| path.exists())
@@ -207,23 +208,54 @@ fn finish_compute(failures: Vec<String>) -> Result<()> {
 }
 
 fn run_verify(theme: &CliTheme) -> Result<()> {
-    let input = prompt_input(theme)?;
+    let input = prompt_verify_source(theme)?;
     let spinner = scanning_spinner(&input);
     let scan_started = Instant::now();
-    let discovery = verify::discover(&input);
+    let scan = verify::scan(&input);
     spinner.finish_and_clear();
-    let mut discovery = discovery?;
-    let discovery_summary = crate::scanner::ScanSummary {
-        files: discovery.jobs.len() as u64 + discovery.unmatched_total,
-        bytes: discovery.total_bytes(),
-        skipped: discovery.missing.len() as u64,
-    };
-    performance::record_scan(scan_started.elapsed(), &discovery_summary);
+    let mut scan = scan?;
+    performance::record_scan(scan_started.elapsed(), scan.summary());
+
+    if !scan.rejected_candidates().is_empty() {
+        print_status(
+            "Skipped",
+            format!(
+                "{} unusable checksum candidates",
+                scan.rejected_candidates().len()
+            ),
+            Style::new().yellow().bold(),
+        );
+        for rejected in scan.rejected_candidates().iter().take(10) {
+            eprintln!("  {rejected}");
+        }
+    }
+
+    if scan.manifest_count() == 0 {
+        print_status(
+            "Detected",
+            "no checksum files in source directory".to_string(),
+            Style::new().yellow().bold(),
+        );
+        let manifest: String = Input::with_theme(theme)
+            .with_prompt("输入校验文件路径")
+            .validate_with(|value: &String| -> std::result::Result<(), String> {
+                if Path::new(&sanitize_path_input(value)).is_file() {
+                    Ok(())
+                } else {
+                    Err("路径不存在或不是普通文件".to_string())
+                }
+            })
+            .interact_text()?;
+        let manifest = sanitize_path_input(&manifest);
+        scan.add_manifest_file(Path::new(&manifest))?;
+    }
+
+    let discovery = scan.finish()?;
 
     print_status(
         "Detected",
         format!(
-            "{} manifests, {} jobs, {} uncovered files",
+            "{} checksum files, {} targets, {} unrelated files ignored",
             discovery.manifests,
             discovery.jobs.len(),
             discovery.unmatched_total
@@ -241,49 +273,6 @@ fn run_verify(theme: &CliTheme) -> Result<()> {
         for path in discovery.missing.iter().take(20) {
             eprintln!("  MISSING  {}", path.display());
         }
-    }
-
-    if discovery.unmatched_total > 100 {
-        bail!(
-            "有 {} 个文件没有摘要, 超过人工输入上限; 请缩小输入范围或补充清单",
-            discovery.unmatched_total
-        );
-    }
-    let unmatched = discovery.unmatched.clone();
-    for file in unmatched {
-        if !ask_confirm(
-            theme,
-            &format!("{} 未检测到摘要, 是否手动输入?", file.relative.display()),
-            true,
-        )? {
-            continue;
-        }
-        let choices = Algorithm::standard_choices();
-        let labels = choices.iter().map(ToString::to_string).collect::<Vec<_>>();
-        let default = choices
-            .iter()
-            .position(|algorithm| algorithm == &Algorithm::Sha256)
-            .unwrap_or(0);
-        let selected = Select::with_theme(theme)
-            .with_prompt("选择算法")
-            .items(&labels)
-            .default(default)
-            .interact()?;
-        let algorithm = choices[selected].clone();
-        let expected_len = algorithm.digest_len();
-        let digest: String = Input::with_theme(theme)
-            .with_prompt(format!("输入 {} 摘要", algorithm))
-            .validate_with(move |input: &String| -> std::result::Result<(), String> {
-                DigestValue::from_hex(input, expected_len)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-            })
-            .interact_text()?;
-        discovery.add_manual(
-            &file,
-            algorithm,
-            DigestValue::from_hex(&digest, expected_len)?,
-        );
     }
 
     if discovery.jobs.is_empty() {
@@ -315,24 +304,57 @@ fn run_verify(theme: &CliTheme) -> Result<()> {
     let processing_started = Instant::now();
     let outcome = verify::verify(&discovery);
     performance::record_processing(processing_started.elapsed());
-    let outcome = outcome?;
+    let mut outcome = outcome?;
     performance::record_file_totals(
         discovery.jobs.len() as u64,
         outcome.passed,
-        (outcome.failed.len() + outcome.errors.len()) as u64,
+        outcome.mismatched + outcome.error_count,
     );
-    print_status(
-        "Verified",
-        format!("{} files passed", outcome.passed),
-        Style::new().green().bold(),
-    );
+    let mismatched = outcome.mismatched;
+    let errors = outcome.error_count;
+    let missing = discovery.missing.len() as u64;
+    let failed = mismatched + errors + missing;
     for failure in &outcome.failed {
         eprintln!("FAILED  {failure}");
+    }
+    if mismatched > outcome.failed.len() as u64 {
+        eprintln!(
+            "  ... {} additional mismatches are available in the verification report",
+            mismatched - outcome.failed.len() as u64
+        );
     }
     for error in &outcome.errors {
         eprintln!("ERROR   {error}");
     }
-    let failed = outcome.failed.len() + outcome.errors.len() + discovery.missing.len();
+    if errors > outcome.errors.len() as u64 {
+        eprintln!(
+            "  ... {} additional errors are available in the verification report",
+            errors - outcome.errors.len() as u64
+        );
+    }
+    print_verification_summary(outcome.passed, mismatched, errors, missing);
+    if ask_confirm(theme, "是否导出校验报告?", true)? {
+        let report_path: String = Input::with_theme(theme)
+            .with_prompt("校验报告路径")
+            .default("verification-report.txt".to_string())
+            .interact_text()?;
+        let report_path = PathBuf::from(sanitize_path_input(&report_path));
+        let overwrite =
+            !report_path.exists() || ask_confirm(theme, "校验报告已存在, 是否覆盖?", false)?;
+        if overwrite {
+            let output_started = Instant::now();
+            verify::write_report(&mut outcome, &discovery, &report_path)?;
+            performance::record_output(
+                output_started.elapsed(),
+                std::slice::from_ref(&report_path),
+            );
+            print_status(
+                "Written",
+                report_path.display().to_string(),
+                Style::new().green().bold(),
+            );
+        }
+    }
     if failed > 0 {
         bail!("校验完成, {failed} 个文件失败或缺失")
     }
@@ -396,6 +418,25 @@ fn prompt_input(theme: &CliTheme) -> Result<InputSpec> {
         .with_prompt("输入文件, 目录或通配符路径")
         .default(".".to_string())
         .interact_text()?;
+    let value = sanitize_path_input(&value);
+    let input = InputSpec::parse(&value)?;
+    performance::set_input(input.describe());
+    Ok(input)
+}
+
+fn prompt_verify_source(theme: &CliTheme) -> Result<InputSpec> {
+    let value: String = Input::with_theme(theme)
+        .with_prompt("输入校验源目录")
+        .default(".".to_string())
+        .validate_with(|value: &String| -> std::result::Result<(), String> {
+            if Path::new(&sanitize_path_input(value)).is_dir() {
+                Ok(())
+            } else {
+                Err("路径不存在或不是目录".to_string())
+            }
+        })
+        .interact_text()?;
+    let value = sanitize_path_input(&value);
     let input = InputSpec::parse(&value)?;
     performance::set_input(input.describe());
     Ok(input)
@@ -466,6 +507,35 @@ fn print_status(label: &str, message: String, label_style: Style) {
     );
 }
 
+fn print_verification_summary(passed: u64, mismatched: u64, errors: u64, missing: u64) {
+    let failed = mismatched + errors + missing;
+    let label = style(format!("{:>12}", "Verification"));
+    let label = if failed == 0 {
+        label.green().bold()
+    } else if passed == 0 {
+        label.red().bold()
+    } else {
+        label.yellow().bold()
+    };
+    let passed = style(format!("{passed} passed")).green().bold();
+    let mismatched = if mismatched == 0 {
+        style("0 mismatched".to_string()).white().dim()
+    } else {
+        style(format!("{mismatched} mismatched")).red().bold()
+    };
+    let errors = if errors == 0 {
+        style("0 errors".to_string()).white().dim()
+    } else {
+        style(format!("{errors} errors")).red().bold()
+    };
+    let missing = if missing == 0 {
+        style("0 missing".to_string()).white().dim()
+    } else {
+        style(format!("{missing} missing")).red().bold()
+    };
+    eprintln!("{label} {passed}, {mismatched}, {errors}, {missing}");
+}
+
 fn print_ok(message: String) {
     eprintln!(
         "  {} {}",
@@ -486,5 +556,45 @@ fn human_bytes(bytes: u64) -> String {
         format!("{bytes} {}", UNITS[unit])
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+fn sanitize_path_input(value: &str) -> String {
+    let cleaned = value
+        .chars()
+        .filter(|character| {
+            !matches!(
+                character,
+                '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{feff}'
+            )
+        })
+        .collect::<String>();
+    let cleaned = cleaned.trim();
+    let unquoted = [
+        ('"', '"'),
+        ('\'', '\''),
+        ('\u{201c}', '\u{201d}'),
+        ('\u{2018}', '\u{2019}'),
+    ]
+    .into_iter()
+    .find_map(|(open, close)| cleaned.strip_prefix(open)?.strip_suffix(close))
+    .unwrap_or(cleaned);
+    unquoted.trim().to_string()
+}
+
+#[cfg(test)]
+mod app_tests {
+    use super::sanitize_path_input;
+
+    #[test]
+    fn sanitizes_windows_clipboard_paths() {
+        assert_eq!(
+            sanitize_path_input("\u{202a}\"D:\\桌面\\checksums.verihash\"\u{202c}"),
+            "D:\\桌面\\checksums.verihash"
+        );
     }
 }

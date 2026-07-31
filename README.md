@@ -10,11 +10,20 @@ checksums on Windows, Linux, and macOS.
 - MD5, the fixed-output SHA-2 and SHA-3 families, variable-length BLAKE2s/BLAKE2b,
   and BLAKE3.
 - Files, recursive directories, relative or absolute paths, and glob patterns.
-- Bounded worker queues, directory-local small-file batches, reusable read buffers,
-  atomic progress counters, and a single result writer.
+- Single-scan disk-backed task plans, bounded worker queues, small-file batches,
+  reusable read buffers, atomic progress counters, and a single result writer.
+- Windows Direct I/O through per-thread IOCP, aligned buffers, adaptive ordered
+  read-ahead, per-volume stream limits, and cached storage capability detection.
 - GNU sumfiles such as `sha256sums`, grouped VeriHash output, and BlazeHash-compatible
   manifests.
-- Automatic discovery of checksum manifests mixed with files being verified.
+- Verification starts from a source directory, automatically discovers GNU/sidecar,
+  VeriHash, and BlazeHash manifests, and requests an external manifest only when none
+  are found. Unreferenced source files are ignored.
+- Verification results can be exported as a dedicated report containing every
+  verified, mismatched, errored, and missing target. This is separate from the
+  optional performance diagnostics report.
+- GNU-style `checksums.txt` files can be inferred from their digest width; malformed
+  or false-positive candidates do not abort the directory scan.
 
 ## Interactive defaults
 
@@ -38,8 +47,9 @@ larger jobs, VeriHash proceeds directly to the multi-select output format prompt
 
 - `algorithm`: algorithm identities, aliases, lengths, and digest values.
 - `hashing`: streaming one-pass multi-hasher.
-- `scanner`: repeatable recursive and glob scanning.
-- `scheduler`: bounded batching, worker lifecycle, and result collection.
+- `scanner`: recursive/glob discovery and disk-backed, per-volume task plans.
+- `scheduler`: discovery-order per-volume lanes, adjacent small-file batching, worker
+  lifecycle, and result collection.
 - `progress`: atomic counters and the terminal renderer.
 - `spool`: bounded-memory temporary metadata and per-algorithm digest streams.
 - `format`: GNU, VeriHash, BlazeHash writing and manifest detection.

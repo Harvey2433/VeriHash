@@ -1,4 +1,5 @@
 use crate::algorithm::{Algorithm, DigestValue};
+use crate::scanner::WorkloadSummary;
 #[cfg(not(windows))]
 use anyhow::Context;
 use anyhow::Result;
@@ -187,7 +188,7 @@ impl HashWorker {
         }
         #[cfg(not(windows))]
         {
-            hash_file_portable(path, algorithms, &mut self.buffer, on_read)
+            hash_file_portable(path, size, algorithms, &mut self.buffer, on_read)
         }
     }
 
@@ -199,22 +200,46 @@ impl HashWorker {
     }
 }
 
-pub fn parallelism_limits(path: &Path, files: usize, algorithm_count: usize) -> (usize, usize) {
+pub fn parallelism_limits(
+    path: &Path,
+    files: usize,
+    algorithm_count: usize,
+    workload: Option<&WorkloadSummary>,
+) -> (usize, usize) {
     #[cfg(windows)]
     {
-        windows::parallelism_limits(path, files, algorithm_count)
+        windows::parallelism_limits(path, files, algorithm_count, workload)
     }
     #[cfg(not(windows))]
     {
-        let _ = (path, algorithm_count);
+        let _ = (path, algorithm_count, workload);
         let workers = files.min(num_cpus::get().max(1)).max(1);
         (workers, workers)
+    }
+}
+
+pub fn bulk_lane_policy(path: &Path, algorithm_count: usize) -> (std::path::PathBuf, usize) {
+    #[cfg(windows)]
+    {
+        windows::bulk_lane_policy(path, algorithm_count)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = algorithm_count;
+        (
+            path.ancestors()
+                .last()
+                .unwrap_or_else(|| Path::new("/"))
+                .to_path_buf(),
+            num_cpus::get().max(1),
+        )
     }
 }
 
 #[cfg(not(windows))]
 fn hash_file_portable<F>(
     path: &Path,
+    expected_size: u64,
     algorithms: &[Algorithm],
     buffer: &mut Vec<u8>,
     mut on_read: F,
@@ -237,6 +262,13 @@ where
         }
         hasher.update(&buffer[..count]);
         on_read(count as u64);
+    }
+    let actual_size = file
+        .metadata()
+        .with_context(|| format!("无法检查 {}", path.display()))?
+        .len();
+    if actual_size != expected_size {
+        anyhow::bail!("文件在计算期间发生变化: {}", path.display());
     }
     hasher.finalize()
 }

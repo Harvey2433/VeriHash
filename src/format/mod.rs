@@ -87,7 +87,7 @@ pub fn output_paths(
     paths
 }
 
-fn write_atomic<F>(path: &Path, write: F) -> Result<()>
+pub(crate) fn write_atomic<F>(path: &Path, write: F) -> Result<()>
 where
     F: FnOnce(&mut dyn Write) -> Result<()>,
 {

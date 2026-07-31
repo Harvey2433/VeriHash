@@ -1,10 +1,12 @@
 use super::{Algorithm, DigestValue, MultiHasher};
 use crate::performance;
+use crate::scanner::WorkloadSummary;
 use anyhow::{Context, Result, anyhow};
 use compio::buf::{BufResult, IoBuf, IoBufMut, SetLen};
 use compio::fs::OpenOptions;
 use compio::io::AsyncReadAt;
-use compio::runtime::{Runtime, spawn};
+use compio::runtime::{JoinHandle, Runtime, spawn};
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString, c_void};
 use std::io;
 use std::mem::{MaybeUninit, size_of, size_of_val};
@@ -12,6 +14,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr::{NonNull, null, null_mut};
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -20,8 +23,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     BusTypeSpaces, BusTypeSsa, BusTypeUfs, BusTypeUnknown, BusTypeUsb, BusTypeVirtual,
     BusTypeiScsi, CreateFileW, FILE_FLAG_NO_BUFFERING, FILE_FLAG_SEQUENTIAL_SCAN,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STORAGE_INFO, FileStorageInfo,
-    GetFileInformationByHandleEx, GetVolumeInformationW, GetVolumeNameForVolumeMountPointW,
-    GetVolumePathNameW, OPEN_EXISTING,
+    GetFileInformationByHandleEx, GetFileSizeEx, GetVolumeInformationW,
+    GetVolumeNameForVolumeMountPointW, GetVolumePathNameW, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -40,6 +43,7 @@ const FALLBACK_ALIGNMENT: usize = 4096;
 const MAX_SECTOR_SIZE: u32 = 1024 * 1024;
 const MIN_REQUEST_SIZE: usize = 64 * 1024;
 const MAX_REQUEST_SIZE: usize = 8 * 1024 * 1024;
+static PROFILE_CACHE: OnceLock<Mutex<Vec<StorageProfile>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MediaKind {
@@ -54,17 +58,44 @@ enum MediaKind {
     Unknown,
 }
 
-pub fn parallelism_limits(path: &Path, files: usize, algorithm_count: usize) -> (usize, usize) {
+pub fn parallelism_limits(
+    path: &Path,
+    files: usize,
+    algorithm_count: usize,
+    workload: Option<&WorkloadSummary>,
+) -> (usize, usize) {
+    performance::record_storage("windows_iocp_mode=per-thread".to_string());
     let cpu_limit = if algorithm_count >= 4 {
         num_cpus::get().max(1).div_ceil(2)
     } else {
         num_cpus::get().max(1)
     };
-    let profile = StorageProfile::detect(path).unwrap_or_else(|_| StorageProfile::fallback(path));
+    let profile = cached_profile(path);
     let policy = profile.io_policy(cpu_limit);
-    let maximum = files.min(cpu_limit).min(policy.maximum).max(1);
+    let workload_limit = workload
+        .filter(|workload| sequential_dominant(workload, files))
+        .map(|_| profile.sequential_stream_limit(cpu_limit))
+        .unwrap_or(policy.maximum);
+    let maximum = files
+        .min(cpu_limit)
+        .min(policy.maximum)
+        .min(workload_limit)
+        .max(1);
     let initial = policy.initial.min(maximum).max(1);
     (initial, maximum)
+}
+
+pub fn bulk_lane_policy(path: &Path, algorithm_count: usize) -> (PathBuf, usize) {
+    let cpu_limit = if algorithm_count >= 4 {
+        num_cpus::get().max(1).div_ceil(2)
+    } else {
+        num_cpus::get().max(1)
+    };
+    let profile = cached_profile(path);
+    (
+        profile.root.clone(),
+        profile.sequential_stream_limit(cpu_limit),
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -168,7 +199,7 @@ impl StorageProfile {
         } else {
             device.removable
         };
-        let media = classify_media(
+        let detected_media = classify_media(
             is_network,
             bus,
             media_removable,
@@ -177,6 +208,20 @@ impl StorageProfile {
             virtual_hint,
             solid_state_hint,
         );
+        let bridge_hdd_fallback = legacy_usb_hdd_fallback(
+            detected_media,
+            bus,
+            queued,
+            media_removable,
+            incurs_seek,
+            trim,
+            solid_state_hint,
+        );
+        let media = if bridge_hdd_fallback {
+            MediaKind::Hdd
+        } else {
+            detected_media
+        };
         let max_transfer =
             adapter.and_then(|descriptor| valid_max_transfer(descriptor.MaximumTransferLength));
         let io_alignment = usize::try_from(logical.max(physical))
@@ -188,7 +233,7 @@ impl StorageProfile {
             !is_network && !matches!(filesystem.to_ascii_uppercase().as_str(), "CDFS" | "UDF");
 
         performance::record_storage(format!(
-            "root={} fs={} media={media:?} transport={} virtual_hint={virtual_hint} solid_state_hint={solid_state_hint} queued={queued} \
+            "root={} fs={} media={media:?} transport={} virtual_hint={virtual_hint} solid_state_hint={solid_state_hint} bridge_hdd_fallback={bridge_hdd_fallback} queued={queued} \
 device_queueing={} adapter_queueing={} removable={} vendor={} product={} revision={} \
 max_transfer={} adapter_bus_version={} adapter_srb_type={} adapter_pio={} adapter_accelerated={} \
 logical_sector={logical} physical_sector={physical} \
@@ -238,7 +283,7 @@ partition_misaligned={partition_misaligned} direct_io={direct}",
         })
     }
 
-    fn request_size(&self, file_size: u64, parallelism: usize) -> usize {
+    fn request_size(&self, file_size: u64, parallelism: usize, read_depth: usize) -> usize {
         let target = if file_size <= MIN_REQUEST_SIZE as u64 {
             usize::try_from(file_size).unwrap_or(MIN_REQUEST_SIZE)
         } else {
@@ -254,7 +299,7 @@ partition_misaligned={partition_misaligned} direct_io={direct}",
             .and_then(|size| round_up(size, self.io_alignment))
             .map_or(target, |file_request| target.min(file_request));
         let per_lane_budget = memory_budget()
-            .checked_div(parallelism.max(1).saturating_mul(2))
+            .checked_div(parallelism.max(1).saturating_mul(read_depth.max(1)))
             .unwrap_or(MIN_REQUEST_SIZE)
             .clamp(MIN_REQUEST_SIZE, MAX_REQUEST_SIZE);
         let target = target.min(per_lane_budget);
@@ -269,6 +314,32 @@ partition_misaligned={partition_misaligned} direct_io={direct}",
 
     fn io_policy(&self, cpu_limit: usize) -> IoPolicy {
         io_policy(self.media, self.bus, self.queued, self.removable, cpu_limit)
+    }
+
+    fn sequential_stream_limit(&self, cpu_limit: usize) -> usize {
+        let policy = self.io_policy(cpu_limit);
+        match self.media {
+            MediaKind::Nvme | MediaKind::PersistentMemory => policy.maximum,
+            MediaKind::Ssd => policy.maximum,
+            MediaKind::Hdd | MediaKind::Optical => 1,
+            MediaKind::Flash | MediaKind::Network | MediaKind::Virtual | MediaKind::Unknown => {
+                policy.maximum
+            }
+        }
+        .max(1)
+    }
+
+    fn read_depth(&self, file_size: u64, parallelism: usize) -> usize {
+        if file_size < LARGE_FILE_LIMIT {
+            return 2;
+        }
+        match self.media {
+            MediaKind::Nvme | MediaKind::PersistentMemory if parallelism <= 1 => 4,
+            MediaKind::Nvme | MediaKind::PersistentMemory => 3,
+            MediaKind::Ssd | MediaKind::Virtual if self.queued && parallelism <= 1 => 4,
+            MediaKind::Ssd | MediaKind::Virtual if self.queued && parallelism == 2 => 3,
+            _ => 2,
+        }
     }
 
     fn fallback(path: &Path) -> Self {
@@ -286,9 +357,19 @@ partition_misaligned={partition_misaligned} direct_io={direct}",
     }
 }
 
+const LARGE_FILE_LIMIT: u64 = 64 * 1024 * 1024;
+
+fn sequential_dominant(workload: &WorkloadSummary, files: usize) -> bool {
+    if files == 0 || workload.large_files == 0 {
+        return false;
+    }
+    let small = workload.tiny_files.saturating_add(workload.small_files);
+    small.saturating_mul(10) <= files as u64
+}
+
 pub struct WindowsHashWorker {
     runtime: Runtime,
-    buffers: Option<(AlignedBuffer, AlignedBuffer)>,
+    buffers: Vec<AlignedBuffer>,
     profiles: Vec<StorageProfile>,
     parallelism: usize,
 }
@@ -297,7 +378,7 @@ impl WindowsHashWorker {
     pub fn new(parallelism: usize) -> Result<Self> {
         Ok(Self {
             runtime: Runtime::new().context("无法创建 Windows IOCP runtime")?,
-            buffers: None,
+            buffers: Vec::new(),
             profiles: Vec::new(),
             parallelism: parallelism.max(1),
         })
@@ -314,34 +395,30 @@ impl WindowsHashWorker {
         F: FnMut(u64),
     {
         if size == 0 {
+            let profile = self.profile_for(path);
+            self.runtime.block_on(validate_empty_file(path, &profile))?;
             return MultiHasher::new(algorithms)?.finalize();
         }
 
         let profile = self.profile_for(path);
-        let request_size = profile.request_size(size, self.parallelism);
+        let read_depth = profile.read_depth(size, self.parallelism);
+        let pending_limit = read_depth.saturating_sub(1).max(1);
+        let request_size = profile.request_size(size, self.parallelism, read_depth);
         performance::record_request_size(request_size);
-        let mut buffers = match self.buffers.take() {
-            Some((first, second))
-                if first.can_serve(request_size, profile.io_alignment)
-                    && second.can_serve(request_size, profile.io_alignment) =>
-            {
-                (first, second)
-            }
-            _ => {
-                let capacity = buffer_growth_capacity(request_size, profile.io_alignment)
-                    .context("I/O 缓冲区增长大小溢出")?;
-                (
-                    AlignedBuffer::new(capacity, profile.io_alignment)?,
-                    AlignedBuffer::new(capacity, profile.io_alignment)?,
-                )
-            }
-        };
-        buffers
-            .0
-            .set_request_size(request_size, profile.io_alignment)?;
-        buffers
-            .1
-            .set_request_size(request_size, profile.io_alignment)?;
+        performance::record_read_depth(pending_limit);
+        self.buffers
+            .retain(|buffer| buffer.can_serve(request_size, profile.io_alignment));
+        let capacity = buffer_growth_capacity(request_size, profile.io_alignment)
+            .context("I/O 缓冲区增长大小溢出")?;
+        while self.buffers.len() < read_depth {
+            self.buffers
+                .push(AlignedBuffer::new(capacity, profile.io_alignment)?);
+        }
+        let split_at = self.buffers.len() - read_depth;
+        let mut buffers = self.buffers.split_off(split_at);
+        for buffer in &mut buffers {
+            buffer.set_request_size(request_size, profile.io_alignment)?;
+        }
 
         let direct = profile.direct;
         let mut attempt = self.runtime.block_on(read_and_hash(
@@ -349,8 +426,11 @@ impl WindowsHashWorker {
             size,
             algorithms,
             &profile,
-            buffers,
-            direct,
+            ReadPipelineConfig {
+                buffers,
+                pending_limit,
+                direct,
+            },
             &mut on_read,
         ));
 
@@ -364,12 +444,15 @@ impl WindowsHashWorker {
                 size,
                 algorithms,
                 &profile,
-                attempt.buffers,
-                false,
+                ReadPipelineConfig {
+                    buffers: attempt.buffers,
+                    pending_limit,
+                    direct: false,
+                },
                 &mut on_read,
             ));
         }
-        self.buffers = Some(attempt.buffers);
+        self.buffers.extend(attempt.buffers);
         attempt.result
     }
 
@@ -385,18 +468,32 @@ impl WindowsHashWorker {
         {
             return profile.clone();
         }
-        let profile = StorageProfile::detect(path).unwrap_or_else(|_| {
-            let profile = StorageProfile::fallback(path);
-            performance::record_storage(format!(
-                "root={} fs=unknown media=Unknown transport=unknown io_alignment={} direct_io=true detection=fallback",
-                profile.root.display(),
-                profile.io_alignment
-            ));
-            profile
-        });
+        let profile = cached_profile(path);
         self.profiles.push(profile.clone());
         profile
     }
+}
+
+fn cached_profile(path: &Path) -> StorageProfile {
+    let cache = PROFILE_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut profiles = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(profile) = profiles
+        .iter()
+        .find(|profile| path.starts_with(&profile.root))
+    {
+        return profile.clone();
+    }
+    let profile = StorageProfile::detect(path).unwrap_or_else(|_| {
+        let profile = StorageProfile::fallback(path);
+        performance::record_storage(format!(
+            "root={} fs=unknown media=Unknown transport=unknown io_alignment={} direct_io=true detection=fallback",
+            profile.root.display(),
+            profile.io_alignment
+        ));
+        profile
+    });
+    profiles.push(profile.clone());
+    profile
 }
 
 impl Drop for WindowsHashWorker {
@@ -407,31 +504,44 @@ impl Drop for WindowsHashWorker {
 
 struct ReadAttempt {
     result: Result<Vec<(Algorithm, DigestValue)>>,
-    buffers: (AlignedBuffer, AlignedBuffer),
+    buffers: Vec<AlignedBuffer>,
     bytes: u64,
 }
+
+struct ReadPipelineConfig {
+    buffers: Vec<AlignedBuffer>,
+    pending_limit: usize,
+    direct: bool,
+}
+
+type PendingRead = JoinHandle<(io::Result<usize>, AlignedBuffer)>;
 
 async fn read_and_hash<F>(
     path: &Path,
     expected_size: u64,
     algorithms: &[Algorithm],
     profile: &StorageProfile,
-    buffers: (AlignedBuffer, AlignedBuffer),
-    direct: bool,
+    config: ReadPipelineConfig,
     on_read: &mut F,
 ) -> ReadAttempt
 where
     F: FnMut(u64),
 {
+    let ReadPipelineConfig {
+        buffers,
+        pending_limit,
+        direct,
+    } = config;
     let mut processed = 0u64;
-    let (mut current, mut spare) = buffers;
+    let mut idle = buffers;
+    let mut pending = VecDeque::<PendingRead>::new();
     let mut direct_active = direct;
     let mut file = match open_hash_file(path, direct_active).await {
         Ok(file) => file,
         Err(error) => {
             return ReadAttempt {
                 result: Err(error).with_context(|| format!("无法打开 {}", path.display())),
-                buffers: (current, spare),
+                buffers: idle,
                 bytes: processed,
             };
         }
@@ -441,19 +551,48 @@ where
         Err(error) => {
             return ReadAttempt {
                 result: Err(error),
-                buffers: (current, spare),
+                buffers: idle,
                 bytes: processed,
             };
         }
     };
 
-    let (mut read, returned) = read_owned(file.clone(), current, processed, direct_active).await;
-    current = returned;
+    let mut next_submit = 0u64;
+    submit_reads(
+        &file,
+        &mut idle,
+        &mut pending,
+        &mut next_submit,
+        expected_size,
+        pending_limit,
+        direct_active,
+    );
+    yield_to_runtime().await;
     loop {
+        let Some(task) = pending.pop_front() else {
+            return ReadAttempt {
+                result: Err(anyhow!("Windows I/O 流水线意外耗尽: {}", path.display())),
+                buffers: idle,
+                bytes: processed,
+            };
+        };
+        let (read, current) = match task.await {
+            Ok(result) => result,
+            Err(error) => {
+                recover_pending(&mut pending, &mut idle).await;
+                return ReadAttempt {
+                    result: Err(anyhow!("Windows I/O 任务异常退出: {error}")),
+                    buffers: idle,
+                    bytes: processed,
+                };
+            }
+        };
         let count = match read {
             Ok(count) => count,
             Err(error) if direct_active && is_direct_io_code(error.raw_os_error()) => {
                 performance::record_direct_fallback();
+                idle.push(current);
+                recover_pending(&mut pending, &mut idle).await;
                 file = match open_hash_file(path, false).await {
                     Ok(file) => file,
                     Err(open_error) => {
@@ -461,24 +600,37 @@ where
                             result: Err(open_error).with_context(|| {
                                 format!("Direct I/O 失败后无法重新打开 {}", path.display())
                             }),
-                            buffers: (current, spare),
+                            buffers: idle,
                             bytes: processed,
                         };
                     }
                 };
                 direct_active = false;
-                (read, current) = read_owned(file.clone(), current, processed, direct_active).await;
+                next_submit = processed;
+                submit_reads(
+                    &file,
+                    &mut idle,
+                    &mut pending,
+                    &mut next_submit,
+                    expected_size,
+                    pending_limit,
+                    direct_active,
+                );
                 continue;
             }
             Err(error) => {
+                idle.push(current);
+                recover_pending(&mut pending, &mut idle).await;
                 return ReadAttempt {
                     result: Err(error).with_context(|| format!("无法读取 {}", path.display())),
-                    buffers: (current, spare),
+                    buffers: idle,
                     bytes: processed,
                 };
             }
         };
         if count == 0 {
+            idle.push(current);
+            recover_pending(&mut pending, &mut idle).await;
             if direct_active {
                 performance::record_early_eof_retry();
                 performance::record_direct_fallback();
@@ -489,13 +641,22 @@ where
                             result: Err(error).with_context(|| {
                                 format!("Direct I/O 提前 EOF 后无法重新打开 {}", path.display())
                             }),
-                            buffers: (current, spare),
+                            buffers: idle,
                             bytes: processed,
                         };
                     }
                 };
                 direct_active = false;
-                (read, current) = read_owned(file.clone(), current, processed, direct_active).await;
+                next_submit = processed;
+                submit_reads(
+                    &file,
+                    &mut idle,
+                    &mut pending,
+                    &mut next_submit,
+                    expected_size,
+                    pending_limit,
+                    direct_active,
+                );
                 continue;
             }
             return ReadAttempt {
@@ -505,63 +666,113 @@ where
                     processed,
                     expected_size
                 )),
-                buffers: (current, spare),
+                buffers: idle,
                 bytes: processed,
             };
         }
         let remaining = expected_size - processed;
         let accepted = usize::try_from(remaining).unwrap_or(usize::MAX).min(count);
         let next_offset = processed + accepted as u64;
-        if count < current.request_size() && next_offset < expected_size {
+        let short_read = count < current.request_size() && next_offset < expected_size;
+        if short_read {
             performance::record_short_read();
         }
 
-        if direct_active && next_offset < expected_size && !profile.valid_file_offset(next_offset) {
-            performance::record_direct_fallback();
-            file = match open_hash_file(path, false).await {
-                Ok(file) => file,
-                Err(error) => {
-                    return ReadAttempt {
-                        result: Err(error)
-                            .with_context(|| format!("无法在短读后重新打开 {}", path.display())),
-                        buffers: (current, spare),
-                        bytes: processed,
-                    };
-                }
-            };
-            direct_active = false;
+        let can_prefetch = next_offset < expected_size
+            && !short_read
+            && (!direct_active || profile.valid_file_offset(next_offset));
+        if can_prefetch {
+            submit_reads(
+                &file,
+                &mut idle,
+                &mut pending,
+                &mut next_submit,
+                expected_size,
+                pending_limit,
+                direct_active,
+            );
         }
 
-        if next_offset >= expected_size {
-            let hash_started = performance::sample_hash_timing().then(Instant::now);
-            hasher.update(&current.as_init()[..accepted]);
-            performance::record_hash(accepted, hash_started.map(|started| started.elapsed()));
-            processed = next_offset;
-            on_read(accepted as u64);
-            return ReadAttempt {
-                result: hasher.finalize(),
-                buffers: (current, spare),
-                bytes: processed,
-            };
-        }
-
-        let next_file = file.clone();
-        let pending_direct = direct_active;
-        let pending =
-            spawn(async move { read_owned(next_file, spare, next_offset, pending_direct).await });
-        yield_to_runtime().await;
         let hash_started = performance::sample_hash_timing().then(Instant::now);
         hasher.update(&current.as_init()[..accepted]);
         performance::record_hash(accepted, hash_started.map(|started| started.elapsed()));
         processed = next_offset;
         on_read(accepted as u64);
+        idle.push(current);
 
-        let (next_read, next_buffer) = pending
-            .await
-            .expect("Compio read-ahead task must run to completion");
-        spare = current;
-        current = next_buffer;
-        read = next_read;
+        if processed >= expected_size {
+            recover_pending(&mut pending, &mut idle).await;
+            if let Err(error) = validate_open_file_size(&file, expected_size, path) {
+                return ReadAttempt {
+                    result: Err(error),
+                    buffers: idle,
+                    bytes: processed,
+                };
+            }
+            return ReadAttempt {
+                result: hasher.finalize(),
+                buffers: idle,
+                bytes: processed,
+            };
+        }
+
+        if short_read || (direct_active && !profile.valid_file_offset(processed)) {
+            recover_pending(&mut pending, &mut idle).await;
+            if direct_active {
+                performance::record_direct_fallback();
+                file = match open_hash_file(path, false).await {
+                    Ok(file) => file,
+                    Err(error) => {
+                        return ReadAttempt {
+                            result: Err(error).with_context(|| {
+                                format!("无法在短读后重新打开 {}", path.display())
+                            }),
+                            buffers: idle,
+                            bytes: processed,
+                        };
+                    }
+                };
+                direct_active = false;
+            }
+            next_submit = processed;
+        }
+        submit_reads(
+            &file,
+            &mut idle,
+            &mut pending,
+            &mut next_submit,
+            expected_size,
+            pending_limit,
+            direct_active,
+        );
+    }
+}
+
+fn submit_reads(
+    file: &compio::fs::File,
+    idle: &mut Vec<AlignedBuffer>,
+    pending: &mut VecDeque<PendingRead>,
+    next_submit: &mut u64,
+    expected_size: u64,
+    pending_limit: usize,
+    direct: bool,
+) {
+    while pending.len() < pending_limit && *next_submit < expected_size {
+        let Some(buffer) = idle.pop() else { break };
+        let offset = *next_submit;
+        *next_submit = next_submit.saturating_add(buffer.request_size() as u64);
+        let file = file.clone();
+        pending.push_back(spawn(async move {
+            read_owned(file, buffer, offset, direct).await
+        }));
+    }
+}
+
+async fn recover_pending(pending: &mut VecDeque<PendingRead>, buffers: &mut Vec<AlignedBuffer>) {
+    while let Some(task) = pending.pop_front() {
+        if let Ok((_, buffer)) = task.await {
+            buffers.push(buffer);
+        }
     }
 }
 
@@ -613,6 +824,42 @@ async fn open_hash_file(path: &Path, direct: bool) -> io::Result<compio::fs::Fil
         started.map(|started| started.elapsed()),
     );
     result
+}
+
+async fn validate_empty_file(path: &Path, profile: &StorageProfile) -> Result<()> {
+    let mut direct = profile.direct;
+    let file = loop {
+        match open_hash_file(path, direct).await {
+            Ok(file) => break file,
+            Err(error) if direct && is_direct_io_code(error.raw_os_error()) => {
+                performance::record_direct_fallback();
+                direct = false;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("无法打开 {}", path.display()));
+            }
+        }
+    };
+    validate_open_file_size(&file, 0, path)
+}
+
+fn validate_open_file_size(file: &compio::fs::File, expected_size: u64, path: &Path) -> Result<()> {
+    let mut actual_size = 0i64;
+    let ok = unsafe { GetFileSizeEx(file.as_raw_handle() as HANDLE, &mut actual_size as *mut i64) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("无法检查 {}", path.display()));
+    }
+    let actual_size = u64::try_from(actual_size).context("文件长度无效")?;
+    if actual_size != expected_size {
+        return Err(anyhow!(
+            "文件在计算期间发生变化: {} (当前 {} 字节, 扫描时为 {} 字节)",
+            path.display(),
+            actual_size,
+            expected_size
+        ));
+    }
+    Ok(())
 }
 
 struct AlignedBuffer {
@@ -1031,6 +1278,24 @@ fn classify_media(
     }
 }
 
+fn legacy_usb_hdd_fallback(
+    media: MediaKind,
+    bus: Option<i32>,
+    queued: bool,
+    removable: Option<bool>,
+    seek: Option<bool>,
+    trim: Option<bool>,
+    solid_state_hint: bool,
+) -> bool {
+    media == MediaKind::Unknown
+        && bus == Some(BusTypeUsb)
+        && !queued
+        && removable == Some(false)
+        && seek.is_none()
+        && trim != Some(true)
+        && !solid_state_hint
+}
+
 fn io_policy(
     media: MediaKind,
     bus: Option<i32>,
@@ -1221,6 +1486,24 @@ mod tests {
             ),
             MediaKind::Hdd
         );
+        assert!(legacy_usb_hdd_fallback(
+            MediaKind::Unknown,
+            Some(BusTypeUsb),
+            false,
+            Some(false),
+            None,
+            None,
+            false,
+        ));
+        assert!(!legacy_usb_hdd_fallback(
+            MediaKind::Unknown,
+            Some(BusTypeUsb),
+            true,
+            Some(false),
+            None,
+            None,
+            false,
+        ));
         assert_eq!(
             classify_media(
                 false,
@@ -1282,6 +1565,38 @@ mod tests {
             (usb_ssd.initial, usb_ssd.maximum, usb_ssd.request_size),
             (2, 8, 2 * 1024 * 1024)
         );
+
+        let native_profile = StorageProfile {
+            root: PathBuf::from("G:\\"),
+            media: MediaKind::Nvme,
+            bus: Some(BusTypeNvme),
+            queued: true,
+            removable: Some(false),
+            io_alignment: 4096,
+            offset_alignment: 512,
+            partition_misaligned: false,
+            direct: true,
+        };
+        assert_eq!(native_profile.sequential_stream_limit(12), 12);
+        assert_eq!(native_profile.read_depth(LARGE_FILE_LIMIT, 1), 4);
+        assert_eq!(native_profile.read_depth(LARGE_FILE_LIMIT, 2), 3);
+        assert_eq!(native_profile.read_depth(LARGE_FILE_LIMIT, 3), 3);
+        assert_eq!(native_profile.read_depth(LARGE_FILE_LIMIT, 12), 3);
+
+        let usb_profile = StorageProfile {
+            media: MediaKind::Ssd,
+            bus: Some(BusTypeUsb),
+            ..native_profile.clone()
+        };
+        assert_eq!(usb_profile.sequential_stream_limit(12), 8);
+
+        let hdd_profile = StorageProfile {
+            media: MediaKind::Hdd,
+            bus: Some(BusTypeSata),
+            queued: true,
+            ..native_profile
+        };
+        assert_eq!(hdd_profile.sequential_stream_limit(12), 1);
     }
 
     #[test]
@@ -1297,8 +1612,8 @@ mod tests {
             partition_misaligned: false,
             direct: true,
         };
-        assert_eq!(profile.request_size(100_000, 2), 102_400);
-        assert_eq!(profile.request_size(8 * 1024 * 1024, 2), 2 * 1024 * 1024);
+        assert_eq!(profile.request_size(100_000, 2, 2), 102_400);
+        assert_eq!(profile.request_size(8 * 1024 * 1024, 2, 2), 2 * 1024 * 1024);
         assert_eq!(valid_max_transfer(u32::MAX), None);
     }
 
@@ -1411,7 +1726,17 @@ mod tests {
         file.set_len(SIZE).unwrap();
         drop(file);
 
+        let profile = StorageProfile::detect(&path).unwrap();
+        let depth = profile.read_depth(SIZE, 1);
+        eprintln!(
+            "test_io_policy media={:?} request_size={} read_depth={}",
+            profile.media,
+            profile.request_size(SIZE, 1, depth),
+            depth
+        );
+
         let zeros = vec![0u8; ZERO_BLOCK_SIZE];
+        let expected_started = Instant::now();
         let mut expected = MultiHasher::new(&[Algorithm::Blake3]).unwrap();
         let mut remaining = SIZE;
         while remaining > 0 {
@@ -1422,12 +1747,21 @@ mod tests {
             remaining -= count as u64;
         }
         let expected = expected.finalize().unwrap();
+        eprintln!(
+            "reference_hash_seconds={:.6}",
+            expected_started.elapsed().as_secs_f64()
+        );
 
         let mut progress = 0u64;
+        let actual_started = Instant::now();
         let actual = WindowsHashWorker::new(1)
             .unwrap()
             .hash_file(&path, SIZE, &[Algorithm::Blake3], |read| progress += read)
             .unwrap();
+        eprintln!(
+            "direct_io_hash_seconds={:.6}",
+            actual_started.elapsed().as_secs_f64()
+        );
         assert_eq!(actual, expected);
         assert_eq!(progress, SIZE);
     }

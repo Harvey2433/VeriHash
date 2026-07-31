@@ -44,6 +44,8 @@ struct LocalIoMetrics {
     buffer_bytes: u64,
     request_size_min: u64,
     request_size_max: u64,
+    read_depth_min: u64,
+    read_depth_max: u64,
 }
 
 impl Default for LocalIoMetrics {
@@ -77,6 +79,8 @@ impl Default for LocalIoMetrics {
             buffer_bytes: 0,
             request_size_min: u64::MAX,
             request_size_max: 0,
+            read_depth_min: u64::MAX,
+            read_depth_max: 0,
         }
     }
 }
@@ -97,6 +101,11 @@ struct ScanRecord {
     files: u64,
     bytes: u64,
     skipped: u64,
+    tiny_files: u64,
+    small_files: u64,
+    medium_files: u64,
+    large_files: u64,
+    largest_file: u64,
 }
 
 struct OutputRecord {
@@ -146,6 +155,8 @@ struct Metrics {
     buffer_bytes: AtomicU64,
     request_size_min: AtomicU64,
     request_size_max: AtomicU64,
+    read_depth_min: AtomicU64,
+    read_depth_max: AtomicU64,
     parallel_initial: AtomicU64,
     parallel_limit: AtomicU64,
     parallel_min: AtomicU64,
@@ -204,6 +215,8 @@ impl Metrics {
             buffer_bytes: AtomicU64::new(0),
             request_size_min: AtomicU64::new(u64::MAX),
             request_size_max: AtomicU64::new(0),
+            read_depth_min: AtomicU64::new(u64::MAX),
+            read_depth_max: AtomicU64::new(0),
             parallel_initial: AtomicU64::new(0),
             parallel_limit: AtomicU64::new(0),
             parallel_min: AtomicU64::new(u64::MAX),
@@ -237,6 +250,11 @@ pub fn record_scan(elapsed: Duration, summary: &ScanSummary) {
             files: summary.files,
             bytes: summary.bytes,
             skipped: summary.skipped,
+            tiny_files: summary.workload.tiny_files,
+            small_files: summary.workload.small_files,
+            medium_files: summary.workload.medium_files,
+            large_files: summary.workload.large_files,
+            largest_file: summary.workload.largest_file,
         });
     });
 }
@@ -437,6 +455,13 @@ pub fn record_request_size(bytes: usize) {
     });
 }
 
+pub fn record_read_depth(depth: usize) {
+    update_local(|local| {
+        local.read_depth_min = local.read_depth_min.min(depth as u64);
+        local.read_depth_max = local.read_depth_max.max(depth as u64);
+    });
+}
+
 pub fn flush_thread_metrics() {
     let Some(metrics) = metrics() else { return };
     let local = LOCAL_IO.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
@@ -479,6 +504,14 @@ pub fn flush_thread_metrics() {
     metrics
         .request_size_max
         .fetch_max(local.request_size_max, Ordering::Relaxed);
+    if local.read_depth_min != u64::MAX {
+        metrics
+            .read_depth_min
+            .fetch_min(local.read_depth_min, Ordering::Relaxed);
+    }
+    metrics
+        .read_depth_max
+        .fetch_max(local.read_depth_max, Ordering::Relaxed);
 }
 
 fn sample_due(sequence: impl FnOnce(&mut LocalIoMetrics) -> &mut u64) -> bool {
@@ -610,6 +643,16 @@ impl Metrics {
                 bytes_text(scan.bytes)
             );
             let _ = writeln!(report, "skipped_entries: {}", scan.skipped);
+            let _ = writeln!(report, "tiny_files_lt_64k: {}", scan.tiny_files);
+            let _ = writeln!(report, "small_files_lt_1m: {}", scan.small_files);
+            let _ = writeln!(report, "medium_files_lt_64m: {}", scan.medium_files);
+            let _ = writeln!(report, "large_files_ge_64m: {}", scan.large_files);
+            let _ = writeln!(
+                report,
+                "largest_file: {} ({})",
+                scan.largest_file,
+                bytes_text(scan.largest_file)
+            );
         }
         if let Some(processing) = info.processing {
             let _ = writeln!(report, "processing_time: {}", duration_text(processing));
@@ -773,6 +816,13 @@ impl Metrics {
             "request_size_max_bytes",
             &self.request_size_max,
         );
+        line_atomic_or_na(
+            &mut report,
+            "read_ahead_depth_min",
+            &self.read_depth_min,
+            u64::MAX,
+        );
+        line_atomic(&mut report, "read_ahead_depth_max", &self.read_depth_max);
 
         report.push_str("\nAdaptive concurrency\n--------------------\n");
         line_atomic(&mut report, "initial_parallelism", &self.parallel_initial);
