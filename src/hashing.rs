@@ -1,20 +1,26 @@
 use crate::algorithm::{Algorithm, DigestValue};
 use crate::io_feedback::IoFeedback;
+#[cfg(all(not(windows), not(target_os = "linux")))]
+use crate::performance;
 use crate::scanner::WorkloadSummary;
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 use anyhow::Context;
 use anyhow::Result;
 use rayon::prelude::*;
 use sha2::digest::Digest;
 use sha2::{Sha224, Sha256, Sha384, Sha512, Sha512_224, Sha512_256};
 use sha3::{Sha3_224, Sha3_256, Sha3_384, Sha3_512};
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 use std::fs::{File, OpenOptions};
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(all(not(windows), not(target_os = "linux")))]
+use std::time::Instant;
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(windows)]
 mod windows;
 
@@ -158,19 +164,23 @@ impl HasherState {
 }
 
 pub struct HashWorker {
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     buffer: Vec<u8>,
+    #[cfg(target_os = "linux")]
+    inner: linux::LinuxHashWorker,
     #[cfg(windows)]
     inner: windows::WindowsHashWorker,
 }
 
 impl HashWorker {
     pub fn with_feedback(parallelism: usize, feedback: Arc<IoFeedback>) -> Result<Self> {
-        #[cfg(not(windows))]
+        #[cfg(all(not(windows), not(target_os = "linux")))]
         let _ = (parallelism, feedback);
         Ok(Self {
-            #[cfg(not(windows))]
+            #[cfg(all(not(windows), not(target_os = "linux")))]
             buffer: Vec::new(),
+            #[cfg(target_os = "linux")]
+            inner: linux::LinuxHashWorker::new(parallelism, feedback)?,
             #[cfg(windows)]
             inner: windows::WindowsHashWorker::new(parallelism, feedback)?,
         })
@@ -190,7 +200,11 @@ impl HashWorker {
         {
             self.inner.hash_file(path, size, algorithms, on_read)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.hash_file(path, size, algorithms, on_read)
+        }
+        #[cfg(all(not(windows), not(target_os = "linux")))]
         {
             hash_file_portable(path, size, algorithms, &mut self.buffer, on_read)
         }
@@ -199,7 +213,9 @@ impl HashWorker {
     pub fn set_parallelism(&mut self, parallelism: usize) {
         #[cfg(windows)]
         self.inner.set_parallelism(parallelism);
-        #[cfg(not(windows))]
+        #[cfg(target_os = "linux")]
+        self.inner.set_parallelism(parallelism);
+        #[cfg(all(not(windows), not(target_os = "linux")))]
         let _ = parallelism;
     }
 }
@@ -214,7 +230,11 @@ pub fn parallelism_limits(
     {
         windows::parallelism_limits(path, files, algorithm_count, workload)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::parallelism_limits(path, files, algorithm_count, workload)
+    }
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     {
         let _ = (path, algorithm_count, workload);
         let workers = files.min(num_cpus::get().max(1)).max(1);
@@ -227,7 +247,11 @@ pub fn bulk_lane_policy(path: &Path, algorithm_count: usize) -> (std::path::Path
     {
         windows::bulk_lane_policy(path, algorithm_count)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    {
+        linux::bulk_lane_policy(path, algorithm_count)
+    }
+    #[cfg(all(not(windows), not(target_os = "linux")))]
     {
         let _ = algorithm_count;
         (
@@ -240,7 +264,7 @@ pub fn bulk_lane_policy(path: &Path, algorithm_count: usize) -> (std::path::Path
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn hash_file_portable<F>(
     path: &Path,
     expected_size: u64,
@@ -253,19 +277,52 @@ where
 {
     if buffer.len() != READ_BUFFER_SIZE {
         buffer.resize(READ_BUFFER_SIZE, 0);
+        performance::record_buffer_allocation(READ_BUFFER_SIZE);
+        performance::record_request_size(READ_BUFFER_SIZE);
+        performance::record_read_depth(1);
     }
-    let mut file =
-        open_for_sequential_read(path).with_context(|| format!("无法打开 {}", path.display()))?;
+    let open_started = performance::sample_open_timing().then(Instant::now);
+    let opened = open_for_sequential_read(path);
+    performance::record_open(
+        false,
+        opened.is_ok(),
+        open_started.map(|started| started.elapsed()),
+    );
+    let mut file = opened.with_context(|| format!("无法打开 {}", path.display()))?;
     let mut hasher = MultiHasher::new(algorithms)?;
+    let mut processed = 0u64;
     loop {
-        let count = file
-            .read(buffer)
-            .with_context(|| format!("无法读取 {}", path.display()))?;
+        let read_started = performance::sample_read_timing().then(Instant::now);
+        let read = file.read(buffer);
+        let read_elapsed = read_started.map(|started| started.elapsed());
+        let count = match read {
+            Ok(count) => {
+                performance::record_read(false, count, true, read_elapsed);
+                count
+            }
+            Err(error) => {
+                performance::record_read(false, 0, false, read_elapsed);
+                return Err(error).with_context(|| format!("无法读取 {}", path.display()));
+            }
+        };
         if count == 0 {
+            if processed < expected_size {
+                performance::record_early_eof();
+                anyhow::bail!("文件发生非预期提前 EOF: {}", path.display());
+            }
             break;
         }
+        if count < buffer.len() {
+            performance::record_short_read();
+        }
+        let hash_started = performance::sample_hash_timing().then(Instant::now);
         hasher.update(&buffer[..count]);
+        performance::record_hash(count, hash_started.map(|started| started.elapsed()));
+        processed = processed.saturating_add(count as u64);
         on_read(count as u64);
+        if processed >= expected_size {
+            break;
+        }
     }
     let actual_size = file
         .metadata()
@@ -277,7 +334,7 @@ where
     hasher.finalize()
 }
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn open_for_sequential_read(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -344,6 +401,18 @@ mod tests {
             get(Algorithm::Blake3),
             "6437b3ac38465133ffb63b75273a8db548c558465d79db03fd359c6cd5bd9d85"
         );
+    }
+
+    #[cfg(all(not(windows), not(target_os = "linux")))]
+    #[test]
+    fn portable_reader_rejects_unexpected_early_eof() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("short.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        let mut buffer = Vec::new();
+        let error =
+            hash_file_portable(&path, 4, &[Algorithm::Md5], &mut buffer, |_| {}).unwrap_err();
+        assert!(error.to_string().contains("提前 EOF"));
     }
 
     #[test]

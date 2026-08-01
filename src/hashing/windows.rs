@@ -649,7 +649,7 @@ where
             idle.push(current);
             recover_pending(&mut pending, &mut idle).await;
             if direct_active {
-                performance::record_early_eof_retry();
+                performance::record_early_eof();
                 performance::record_direct_fallback();
                 file = match open_hash_file(path, false).await {
                     Ok(file) => file,

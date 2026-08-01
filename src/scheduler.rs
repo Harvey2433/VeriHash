@@ -40,6 +40,14 @@ struct WorkerContext {
     feedback: Arc<IoFeedback>,
 }
 
+struct MetricsFlushGuard;
+
+impl Drop for MetricsFlushGuard {
+    fn drop(&mut self) {
+        crate::performance::flush_thread_metrics();
+    }
+}
+
 pub struct ComputeOutcome {
     pub spool: ResultSpool,
     pub display_results: Vec<ComputedFile>,
@@ -173,6 +181,7 @@ fn flush_batch(
 }
 
 fn worker_loop(tasks: Receiver<TaskBatch>, context: WorkerContext) {
+    let _metrics_flush = MetricsFlushGuard;
     let mut hash_worker =
         HashWorker::with_feedback(context.parallelism, Arc::clone(&context.feedback))
             .map_err(|error| format!("{error:#}"));

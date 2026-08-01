@@ -37,6 +37,12 @@ num_cpus = "1.16"
 # 优雅的错误处理
 anyhow = "1.0"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+compio = { version = "0.19.1", default-features = false, features = ["fs", "io-uring", "polling"] }
+
 [target.'cfg(windows)'.dependencies]
 compio = { version = "0.19.1", default-features = false, features = ["fs"] }
 
@@ -57,7 +63,7 @@ features = [
 [profile.release]
 # 最高强度优化
 opt-level = 3
-lto = true
+lto = "fat"
 # 单线程编译单元
 codegen-units = 1
 # 剥离调试信息

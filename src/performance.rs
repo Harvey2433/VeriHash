@@ -1,5 +1,3 @@
-#![cfg_attr(not(windows), allow(dead_code))]
-
 use crate::io_feedback::IoWindow;
 use crate::scanner::ScanSummary;
 use anyhow::{Context, Result};
@@ -27,6 +25,9 @@ struct LocalIoMetrics {
     open_errors: u64,
     open_samples: u64,
     open_ns: u64,
+    open_min_ns: u64,
+    open_max_ns: u64,
+    open_latency: [u64; LATENCY_BUCKETS],
     direct_read_ops: u64,
     direct_read_bytes: u64,
     cached_read_ops: u64,
@@ -37,9 +38,13 @@ struct LocalIoMetrics {
     read_min_ns: u64,
     read_max_ns: u64,
     read_latency: [u64; LATENCY_BUCKETS],
+    zero_length_reads: u64,
     hash_samples: u64,
     hash_sample_bytes: u64,
     hash_ns: u64,
+    hash_min_ns: u64,
+    hash_max_ns: u64,
+    hash_latency: [u64; LATENCY_BUCKETS],
     direct_fallbacks: u64,
     short_reads: u64,
     early_eof_retries: u64,
@@ -62,6 +67,9 @@ impl Default for LocalIoMetrics {
             open_errors: 0,
             open_samples: 0,
             open_ns: 0,
+            open_min_ns: u64::MAX,
+            open_max_ns: 0,
+            open_latency: [0; LATENCY_BUCKETS],
             direct_read_ops: 0,
             direct_read_bytes: 0,
             cached_read_ops: 0,
@@ -72,9 +80,13 @@ impl Default for LocalIoMetrics {
             read_min_ns: u64::MAX,
             read_max_ns: 0,
             read_latency: [0; LATENCY_BUCKETS],
+            zero_length_reads: 0,
             hash_samples: 0,
             hash_sample_bytes: 0,
             hash_ns: 0,
+            hash_min_ns: u64::MAX,
+            hash_max_ns: 0,
+            hash_latency: [0; LATENCY_BUCKETS],
             direct_fallbacks: 0,
             short_reads: 0,
             early_eof_retries: 0,
@@ -138,6 +150,9 @@ struct Metrics {
     open_errors: AtomicU64,
     open_samples: AtomicU64,
     open_ns: AtomicU64,
+    open_min_ns: AtomicU64,
+    open_max_ns: AtomicU64,
+    open_latency: [AtomicU64; LATENCY_BUCKETS],
     direct_read_ops: AtomicU64,
     direct_read_bytes: AtomicU64,
     cached_read_ops: AtomicU64,
@@ -148,9 +163,13 @@ struct Metrics {
     read_min_ns: AtomicU64,
     read_max_ns: AtomicU64,
     read_latency: [AtomicU64; LATENCY_BUCKETS],
+    zero_length_reads: AtomicU64,
     hash_ns: AtomicU64,
     hash_samples: AtomicU64,
     hash_sample_bytes: AtomicU64,
+    hash_min_ns: AtomicU64,
+    hash_max_ns: AtomicU64,
+    hash_latency: [AtomicU64; LATENCY_BUCKETS],
     direct_fallbacks: AtomicU64,
     short_reads: AtomicU64,
     early_eof_retries: AtomicU64,
@@ -204,6 +223,9 @@ impl Metrics {
             open_errors: AtomicU64::new(0),
             open_samples: AtomicU64::new(0),
             open_ns: AtomicU64::new(0),
+            open_min_ns: AtomicU64::new(u64::MAX),
+            open_max_ns: AtomicU64::new(0),
+            open_latency: std::array::from_fn(|_| AtomicU64::new(0)),
             direct_read_ops: AtomicU64::new(0),
             direct_read_bytes: AtomicU64::new(0),
             cached_read_ops: AtomicU64::new(0),
@@ -214,9 +236,13 @@ impl Metrics {
             read_min_ns: AtomicU64::new(u64::MAX),
             read_max_ns: AtomicU64::new(0),
             read_latency: std::array::from_fn(|_| AtomicU64::new(0)),
+            zero_length_reads: AtomicU64::new(0),
             hash_ns: AtomicU64::new(0),
             hash_samples: AtomicU64::new(0),
             hash_sample_bytes: AtomicU64::new(0),
+            hash_min_ns: AtomicU64::new(u64::MAX),
+            hash_max_ns: AtomicU64::new(0),
+            hash_latency: std::array::from_fn(|_| AtomicU64::new(0)),
             direct_fallbacks: AtomicU64::new(0),
             short_reads: AtomicU64::new(0),
             early_eof_retries: AtomicU64::new(0),
@@ -252,6 +278,7 @@ pub fn start(mode: &str) {
 
 pub fn set_input(input: &str) {
     with_info(|info| info.input = input.to_string());
+    record_platform_storage(input);
 }
 
 pub fn set_algorithms(algorithms: String) {
@@ -391,7 +418,11 @@ pub fn record_open(direct: bool, success: bool, elapsed: Option<Duration>) {
         }
         if let Some(elapsed) = elapsed {
             local.open_samples += 1;
-            local.open_ns = local.open_ns.saturating_add(duration_ns(elapsed));
+            let nanos = duration_ns(elapsed);
+            local.open_ns = local.open_ns.saturating_add(nanos);
+            local.open_min_ns = local.open_min_ns.min(nanos);
+            local.open_max_ns = local.open_max_ns.max(nanos);
+            local.open_latency[latency_bucket(elapsed)] += 1;
         }
     });
 }
@@ -414,6 +445,8 @@ pub fn record_read(direct: bool, bytes: usize, success: bool, elapsed: Option<Du
         }
         if !success {
             local.read_errors += 1;
+        } else if bytes == 0 {
+            local.zero_length_reads += 1;
         }
         let Some(elapsed) = elapsed else { return };
         local.read_samples += 1;
@@ -421,9 +454,7 @@ pub fn record_read(direct: bool, bytes: usize, success: bool, elapsed: Option<Du
         local.read_ns = local.read_ns.saturating_add(nanos);
         local.read_min_ns = local.read_min_ns.min(nanos);
         local.read_max_ns = local.read_max_ns.max(nanos);
-        let micros = elapsed.as_micros().max(1) as u64;
-        let bucket = (u64::BITS - micros.leading_zeros() - 1) as usize;
-        local.read_latency[bucket.min(LATENCY_BUCKETS - 1)] += 1;
+        local.read_latency[latency_bucket(elapsed)] += 1;
     });
 }
 
@@ -439,11 +470,16 @@ pub fn record_hash(bytes: usize, elapsed: Option<Duration>) {
         LOCAL_IO.with_borrow_mut(|local| {
             local.hash_samples += 1;
             local.hash_sample_bytes += bytes as u64;
-            local.hash_ns = local.hash_ns.saturating_add(duration_ns(elapsed));
+            let nanos = duration_ns(elapsed);
+            local.hash_ns = local.hash_ns.saturating_add(nanos);
+            local.hash_min_ns = local.hash_min_ns.min(nanos);
+            local.hash_max_ns = local.hash_max_ns.max(nanos);
+            local.hash_latency[latency_bucket(elapsed)] += 1;
         });
     }
 }
 
+#[cfg(windows)]
 pub fn record_direct_fallback() {
     update_local(|local| local.direct_fallbacks += 1);
 }
@@ -452,7 +488,7 @@ pub fn record_short_read() {
     update_local(|local| local.short_reads += 1);
 }
 
-pub fn record_early_eof_retry() {
+pub fn record_early_eof() {
     update_local(|local| local.early_eof_retries += 1);
 }
 
@@ -485,6 +521,17 @@ pub fn flush_thread_metrics() {
     add(&metrics.open_errors, local.open_errors);
     add(&metrics.open_samples, local.open_samples);
     add(&metrics.open_ns, local.open_ns);
+    if local.open_samples > 0 {
+        metrics
+            .open_min_ns
+            .fetch_min(local.open_min_ns, Ordering::Relaxed);
+        metrics
+            .open_max_ns
+            .fetch_max(local.open_max_ns, Ordering::Relaxed);
+    }
+    for (global, value) in metrics.open_latency.iter().zip(local.open_latency) {
+        add(global, value);
+    }
     add(&metrics.direct_read_ops, local.direct_read_ops);
     add(&metrics.direct_read_bytes, local.direct_read_bytes);
     add(&metrics.cached_read_ops, local.cached_read_ops);
@@ -503,9 +550,21 @@ pub fn flush_thread_metrics() {
     for (global, value) in metrics.read_latency.iter().zip(local.read_latency) {
         add(global, value);
     }
+    add(&metrics.zero_length_reads, local.zero_length_reads);
     add(&metrics.hash_samples, local.hash_samples);
     add(&metrics.hash_sample_bytes, local.hash_sample_bytes);
     add(&metrics.hash_ns, local.hash_ns);
+    if local.hash_samples > 0 {
+        metrics
+            .hash_min_ns
+            .fetch_min(local.hash_min_ns, Ordering::Relaxed);
+        metrics
+            .hash_max_ns
+            .fetch_max(local.hash_max_ns, Ordering::Relaxed);
+    }
+    for (global, value) in metrics.hash_latency.iter().zip(local.hash_latency) {
+        add(global, value);
+    }
     add(&metrics.direct_fallbacks, local.direct_fallbacks);
     add(&metrics.short_reads, local.short_reads);
     add(&metrics.early_eof_retries, local.early_eof_retries);
@@ -538,6 +597,12 @@ fn sample_due(sequence: impl FnOnce(&mut LocalIoMetrics) -> &mut u64) -> bool {
         *sequence = sequence.wrapping_add(1);
         *sequence == 1 || sequence.is_multiple_of(TIMING_SAMPLE_INTERVAL)
     })
+}
+
+fn latency_bucket(elapsed: Duration) -> usize {
+    let micros = elapsed.as_micros().max(1).min(u128::from(u64::MAX)) as u64;
+    let bucket = (u64::BITS - micros.leading_zeros() - 1) as usize;
+    bucket.min(LATENCY_BUCKETS - 1)
 }
 
 fn update_local(update: impl FnOnce(&mut LocalIoMetrics)) {
@@ -669,6 +734,7 @@ impl Metrics {
             std::env::consts::ARCH
         );
         let _ = writeln!(report, "logical_cpus: {}", num_cpus::get());
+        write_platform_details(&mut report);
         let _ = writeln!(report, "mode: {}", info.mode);
         let _ = writeln!(report, "input: {}", info.input);
         let _ = writeln!(report, "algorithms: {}", info.algorithms);
@@ -753,20 +819,43 @@ impl Metrics {
             }
         }
 
-        report.push_str("\nWindows I/O pipeline\n--------------------\n");
+        write_io_pipeline_heading(&mut report);
         let _ = writeln!(
             report,
             "timing_sample_interval: 1/{TIMING_SAMPLE_INTERVAL} operations"
         );
-        line_atomic(&mut report, "direct_open_operations", &self.direct_open_ops);
+        report.push_str("counter_aggregation: thread-local, flush-on-worker-exit\n");
+        report.push_str("process_snapshots: phase-boundaries-only\n");
+        report.push_str("background_metrics_sampler: disabled\n");
+        #[cfg(windows)]
+        {
+            line_atomic(&mut report, "direct_open_operations", &self.direct_open_ops);
+        }
         line_atomic(&mut report, "cached_open_operations", &self.cached_open_ops);
         line_atomic(&mut report, "open_errors", &self.open_errors);
         line_atomic(&mut report, "open_timing_samples", &self.open_samples);
         line_duration(&mut report, "open_time_sampled", &self.open_ns);
-        line_atomic(&mut report, "direct_read_operations", &self.direct_read_ops);
-        line_bytes(&mut report, "direct_read_bytes", &self.direct_read_bytes);
+        write_latency_summary(
+            &mut report,
+            "open",
+            &self.open_samples,
+            &self.open_ns,
+            &self.open_min_ns,
+            &self.open_max_ns,
+            &self.open_latency,
+        );
+        #[cfg(windows)]
+        {
+            line_atomic(&mut report, "direct_read_operations", &self.direct_read_ops);
+            line_bytes(&mut report, "direct_read_bytes", &self.direct_read_bytes);
+        }
         line_atomic(&mut report, "cached_read_operations", &self.cached_read_ops);
         line_bytes(&mut report, "cached_read_bytes", &self.cached_read_bytes);
+        line_atomic(
+            &mut report,
+            "zero_length_read_operations",
+            &self.zero_length_reads,
+        );
         line_atomic(&mut report, "read_errors", &self.read_errors);
         line_atomic(&mut report, "read_timing_samples", &self.read_samples);
         line_duration(&mut report, "io_wait_time_sampled", &self.read_ns);
@@ -786,17 +875,17 @@ impl Metrics {
             let _ = writeln!(
                 report,
                 "read_latency_p50_approx: {}",
-                nanos_text(self.percentile_ns(50))
+                nanos_text(percentile_ns(&self.read_latency, 50))
             );
             let _ = writeln!(
                 report,
                 "read_latency_p95_approx: {}",
-                nanos_text(self.percentile_ns(95))
+                nanos_text(percentile_ns(&self.read_latency, 95))
             );
             let _ = writeln!(
                 report,
                 "read_latency_p99_approx: {}",
-                nanos_text(self.percentile_ns(99))
+                nanos_text(percentile_ns(&self.read_latency, 99))
             );
             let _ = writeln!(report, "read_latency_max: {}", nanos_text(max));
         }
@@ -824,6 +913,15 @@ impl Metrics {
         line_atomic(&mut report, "hash_timing_samples", &self.hash_samples);
         line_bytes(&mut report, "hash_sample_bytes", &self.hash_sample_bytes);
         line_duration(&mut report, "hash_update_time_sampled", &self.hash_ns);
+        write_latency_summary(
+            &mut report,
+            "hash_update",
+            &self.hash_samples,
+            &self.hash_ns,
+            &self.hash_min_ns,
+            &self.hash_max_ns,
+            &self.hash_latency,
+        );
         let hash_ns = self.hash_ns.load(Ordering::Relaxed);
         if hash_ns > 0 {
             let _ = writeln!(
@@ -835,19 +933,38 @@ impl Metrics {
                 )
             );
         }
-        line_atomic(&mut report, "direct_io_fallbacks", &self.direct_fallbacks);
+        #[cfg(windows)]
+        {
+            line_atomic(&mut report, "direct_io_fallbacks", &self.direct_fallbacks);
+        }
         line_atomic(&mut report, "short_reads", &self.short_reads);
-        line_atomic(&mut report, "early_eof_retries", &self.early_eof_retries);
-        line_atomic(
-            &mut report,
-            "aligned_buffer_allocations",
-            &self.buffer_allocations,
-        );
-        line_bytes(
-            &mut report,
-            "aligned_buffer_bytes_allocated",
-            &self.buffer_bytes,
-        );
+        line_atomic(&mut report, "early_eof_events", &self.early_eof_retries);
+        #[cfg(windows)]
+        {
+            line_atomic(
+                &mut report,
+                "aligned_buffer_allocations",
+                &self.buffer_allocations,
+            );
+            line_bytes(
+                &mut report,
+                "aligned_buffer_bytes_allocated",
+                &self.buffer_bytes,
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            line_atomic(
+                &mut report,
+                "read_buffer_allocations",
+                &self.buffer_allocations,
+            );
+            line_bytes(
+                &mut report,
+                "read_buffer_bytes_allocated",
+                &self.buffer_bytes,
+            );
+        }
         line_atomic_or_na(
             &mut report,
             "request_size_min_bytes",
@@ -942,26 +1059,70 @@ impl Metrics {
         process_end.write_delta(&self.process_start, elapsed, &mut report);
         report
     }
+}
 
-    fn percentile_ns(&self, percentile: u64) -> u64 {
-        let total = self
-            .read_latency
-            .iter()
-            .map(|bucket| bucket.load(Ordering::Relaxed))
-            .sum::<u64>();
-        if total == 0 {
-            return 0;
-        }
-        let target = total.saturating_mul(percentile).div_ceil(100);
-        let mut cumulative = 0u64;
-        for (index, bucket) in self.read_latency.iter().enumerate() {
-            cumulative += bucket.load(Ordering::Relaxed);
-            if cumulative >= target {
-                return (1u64 << index).saturating_mul(1_000);
-            }
-        }
-        1u64 << (LATENCY_BUCKETS - 1)
+fn percentile_ns(buckets: &[AtomicU64; LATENCY_BUCKETS], percentile: u64) -> u64 {
+    let total = buckets
+        .iter()
+        .map(|bucket| bucket.load(Ordering::Relaxed))
+        .sum::<u64>();
+    if total == 0 {
+        return 0;
     }
+    let target = total.saturating_mul(percentile).div_ceil(100);
+    let mut cumulative = 0u64;
+    for (index, bucket) in buckets.iter().enumerate() {
+        cumulative += bucket.load(Ordering::Relaxed);
+        if cumulative >= target {
+            return (1u64 << index).saturating_mul(1_000);
+        }
+    }
+    1u64 << (LATENCY_BUCKETS - 1)
+}
+
+fn write_latency_summary(
+    report: &mut String,
+    prefix: &str,
+    samples: &AtomicU64,
+    total_ns: &AtomicU64,
+    min_ns: &AtomicU64,
+    max_ns: &AtomicU64,
+    buckets: &[AtomicU64; LATENCY_BUCKETS],
+) {
+    let samples = samples.load(Ordering::Relaxed);
+    if samples == 0 {
+        return;
+    }
+    let average = total_ns
+        .load(Ordering::Relaxed)
+        .checked_div(samples)
+        .unwrap_or(0);
+    let _ = writeln!(
+        report,
+        "{prefix}_latency_min: {}",
+        nanos_text(min_ns.load(Ordering::Relaxed))
+    );
+    let _ = writeln!(report, "{prefix}_latency_avg: {}", nanos_text(average));
+    let _ = writeln!(
+        report,
+        "{prefix}_latency_p50_approx: {}",
+        nanos_text(percentile_ns(buckets, 50))
+    );
+    let _ = writeln!(
+        report,
+        "{prefix}_latency_p95_approx: {}",
+        nanos_text(percentile_ns(buckets, 95))
+    );
+    let _ = writeln!(
+        report,
+        "{prefix}_latency_p99_approx: {}",
+        nanos_text(percentile_ns(buckets, 99))
+    );
+    let _ = writeln!(
+        report,
+        "{prefix}_latency_max: {}",
+        nanos_text(max_ns.load(Ordering::Relaxed))
+    );
 }
 
 fn line_atomic(report: &mut String, label: &str, value: &AtomicU64) {
@@ -1022,6 +1183,139 @@ fn bytes_text(bytes: u64) -> String {
 fn rate_text(bytes: u64, elapsed: Duration) -> String {
     let per_second = bytes as f64 / elapsed.as_secs_f64().max(f64::EPSILON);
     format!("{}/s", bytes_text(per_second.min(u64::MAX as f64) as u64))
+}
+
+#[cfg(windows)]
+fn write_io_pipeline_heading(report: &mut String) {
+    report.push_str("\nWindows I/O pipeline\n--------------------\n");
+}
+
+#[cfg(target_os = "linux")]
+fn write_io_pipeline_heading(report: &mut String) {
+    report.push_str("\nLinux async cached I/O pipeline\n-------------------------------\n");
+}
+
+#[cfg(all(not(windows), not(target_os = "linux")))]
+fn write_io_pipeline_heading(report: &mut String) {
+    report.push_str("\nPortable cached I/O pipeline\n----------------------------\n");
+}
+
+#[cfg(target_os = "linux")]
+fn write_platform_details(report: &mut String) {
+    if let Ok(release) = std::fs::read_to_string("/proc/sys/kernel/osrelease") {
+        let _ = writeln!(report, "kernel_release: {}", release.trim());
+    }
+    let _ = writeln!(report, "clock_ticks_per_second: {}", linux_clock_ticks());
+    let _ = writeln!(report, "page_size: {}", linux_page_size());
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_platform_details(_report: &mut String) {}
+
+#[cfg(target_os = "linux")]
+fn record_platform_storage(input: &str) {
+    if let Some(profile) = linux_storage_profile(input) {
+        record_storage(profile);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn record_platform_storage(_input: &str) {}
+
+#[cfg(target_os = "linux")]
+fn linux_storage_profile(input: &str) -> Option<String> {
+    let path = linux_probe_path(input);
+    let mount_info = std::fs::read_to_string("/proc/self/mountinfo").ok()?;
+    let mut selected: Option<(usize, Vec<&str>, Vec<&str>)> = None;
+    for line in mount_info.lines() {
+        let Some((left, right)) = line.split_once(" - ") else {
+            continue;
+        };
+        let left = left.split_whitespace().collect::<Vec<_>>();
+        let right = right.split_whitespace().collect::<Vec<_>>();
+        if left.len() < 6 || right.len() < 3 {
+            continue;
+        }
+        let mount = PathBuf::from(decode_mount_field(left[4]));
+        if path.starts_with(&mount) {
+            let depth = mount.as_os_str().len();
+            if selected.as_ref().is_none_or(|current| depth > current.0) {
+                selected = Some((depth, left, right));
+            }
+        }
+    }
+    let (_, left, right) = selected?;
+    let device = left[2];
+    let mut fields = vec![
+        "linux_io=async-buffered".to_string(),
+        format!("mount={}", decode_mount_field(left[4])),
+        format!("fs={}", right[0]),
+        format!("source={}", decode_mount_field(right[1])),
+        format!("device={device}"),
+        format!("mount_options={}", left[5]),
+    ];
+    if let Some(queue) = linux_queue_path(device) {
+        for (label, name) in [
+            ("rotational", "rotational"),
+            ("logical_block_size", "logical_block_size"),
+            ("physical_block_size", "physical_block_size"),
+            ("read_ahead_kb", "read_ahead_kb"),
+            ("max_sectors_kb", "max_sectors_kb"),
+            ("max_hw_sectors_kb", "max_hw_sectors_kb"),
+            ("scheduler", "scheduler"),
+        ] {
+            if let Ok(value) = std::fs::read_to_string(queue.join(name)) {
+                fields.push(format!("{label}={}", value.trim()));
+            }
+        }
+    }
+    Some(fields.join(" "))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_probe_path(input: &str) -> PathBuf {
+    let wildcard = input.find(['*', '?', '[']).unwrap_or(input.len());
+    let mut path = PathBuf::from(&input[..wildcard]);
+    if path.as_os_str().is_empty() {
+        path.push(".");
+    }
+    while !path.exists() && path.pop() {}
+    path.canonicalize().unwrap_or(path)
+}
+
+#[cfg(target_os = "linux")]
+fn decode_mount_field(value: &str) -> String {
+    value
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_queue_path(device: &str) -> Option<PathBuf> {
+    let mut path = std::fs::canonicalize(format!("/sys/dev/block/{device}")).ok()?;
+    loop {
+        let queue = path.join("queue");
+        if queue.is_dir() {
+            return Some(queue);
+        }
+        if !path.pop() {
+            return None;
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_clock_ticks() -> u64 {
+    let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    u64::try_from(value).unwrap_or(100).max(1)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_page_size() -> u64 {
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(value).unwrap_or(4096).max(1)
 }
 
 #[cfg(windows)]
@@ -1168,22 +1462,365 @@ fn filetime_value(value: windows_sys::Win32::Foundation::FILETIME) -> u64 {
     (u64::from(value.dwHighDateTime) << 32) | u64::from(value.dwLowDateTime)
 }
 
-#[cfg(windows)]
 fn delta_line(report: &mut String, label: &str, end: u64, start: u64) {
     let _ = writeln!(report, "{label}: {}", end.saturating_sub(start));
 }
 
-#[cfg(windows)]
 fn delta_bytes(report: &mut String, label: &str, end: u64, start: u64) {
     let value = end.saturating_sub(start);
     let _ = writeln!(report, "{label}: {value} ({})", bytes_text(value));
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Default)]
+struct ProcessSnapshot {
+    available: bool,
+    user_ticks: u64,
+    system_ticks: u64,
+    minor_faults: u64,
+    major_faults: u64,
+    logical_read_bytes: u64,
+    logical_write_bytes: u64,
+    read_syscalls: u64,
+    write_syscalls: u64,
+    storage_read_bytes: u64,
+    storage_write_bytes: u64,
+    cancelled_write_bytes: u64,
+    resident_memory: u64,
+    peak_resident_memory: u64,
+    virtual_memory: u64,
+    peak_virtual_memory: u64,
+    voluntary_context_switches: u64,
+    involuntary_context_switches: u64,
+    threads: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl ProcessSnapshot {
+    fn capture() -> Self {
+        let mut snapshot = Self::default();
+        if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+            snapshot.available = snapshot.parse_stat(&stat);
+        }
+        if let Ok(io) = std::fs::read_to_string("/proc/self/io") {
+            for line in io.lines() {
+                let Some((key, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let value = value.trim().parse::<u64>().unwrap_or(0);
+                match key {
+                    "rchar" => snapshot.logical_read_bytes = value,
+                    "wchar" => snapshot.logical_write_bytes = value,
+                    "syscr" => snapshot.read_syscalls = value,
+                    "syscw" => snapshot.write_syscalls = value,
+                    "read_bytes" => snapshot.storage_read_bytes = value,
+                    "write_bytes" => snapshot.storage_write_bytes = value,
+                    "cancelled_write_bytes" => snapshot.cancelled_write_bytes = value,
+                    _ => {}
+                }
+            }
+        }
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                let Some((key, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let value = value.trim();
+                match key {
+                    "VmRSS" => snapshot.resident_memory = parse_proc_kib(value),
+                    "VmHWM" => snapshot.peak_resident_memory = parse_proc_kib(value),
+                    "VmSize" => snapshot.virtual_memory = parse_proc_kib(value),
+                    "VmPeak" => snapshot.peak_virtual_memory = parse_proc_kib(value),
+                    "Threads" => snapshot.threads = parse_proc_number(value),
+                    "voluntary_ctxt_switches" => {
+                        snapshot.voluntary_context_switches = parse_proc_number(value)
+                    }
+                    "nonvoluntary_ctxt_switches" => {
+                        snapshot.involuntary_context_switches = parse_proc_number(value)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        snapshot
+    }
+
+    fn parse_stat(&mut self, stat: &str) -> bool {
+        let Some((_, fields)) = stat.rsplit_once(") ") else {
+            return false;
+        };
+        let fields = fields.split_whitespace().collect::<Vec<_>>();
+        let parse = |index: usize| {
+            fields
+                .get(index)
+                .and_then(|value| value.parse::<u64>().ok())
+        };
+        let Some(minor_faults) = parse(7) else {
+            return false;
+        };
+        let Some(major_faults) = parse(9) else {
+            return false;
+        };
+        let Some(user_ticks) = parse(11) else {
+            return false;
+        };
+        let Some(system_ticks) = parse(12) else {
+            return false;
+        };
+        self.minor_faults = minor_faults;
+        self.major_faults = major_faults;
+        self.user_ticks = user_ticks;
+        self.system_ticks = system_ticks;
+        true
+    }
+
+    fn write_delta(self, start: &Self, elapsed: Duration, report: &mut String) {
+        if !self.available || !start.available {
+            report.push_str("native_process_counters: unavailable\n");
+            return;
+        }
+        let ticks = linux_clock_ticks() as f64;
+        let user = self.user_ticks.saturating_sub(start.user_ticks) as f64 / ticks;
+        let kernel = self.system_ticks.saturating_sub(start.system_ticks) as f64 / ticks;
+        let cpu = user + kernel;
+        let capacity = elapsed.as_secs_f64() * num_cpus::get().max(1) as f64;
+        let _ = writeln!(report, "cpu_kernel_time: {kernel:.6} s");
+        let _ = writeln!(report, "cpu_user_time: {user:.6} s");
+        let _ = writeln!(report, "cpu_total_time: {cpu:.6} s");
+        let _ = writeln!(
+            report,
+            "cpu_utilization_all_logical: {:.2}%",
+            if capacity > 0.0 {
+                cpu / capacity * 100.0
+            } else {
+                0.0
+            }
+        );
+        delta_line(
+            report,
+            "process_read_syscalls",
+            self.read_syscalls,
+            start.read_syscalls,
+        );
+        delta_line(
+            report,
+            "process_write_syscalls",
+            self.write_syscalls,
+            start.write_syscalls,
+        );
+        delta_bytes(
+            report,
+            "process_logical_read_bytes",
+            self.logical_read_bytes,
+            start.logical_read_bytes,
+        );
+        delta_bytes(
+            report,
+            "process_logical_write_bytes",
+            self.logical_write_bytes,
+            start.logical_write_bytes,
+        );
+        delta_bytes(
+            report,
+            "process_storage_read_bytes",
+            self.storage_read_bytes,
+            start.storage_read_bytes,
+        );
+        delta_bytes(
+            report,
+            "process_storage_write_bytes",
+            self.storage_write_bytes,
+            start.storage_write_bytes,
+        );
+        delta_bytes(
+            report,
+            "process_cancelled_write_bytes",
+            self.cancelled_write_bytes,
+            start.cancelled_write_bytes,
+        );
+        let logical_read = self
+            .logical_read_bytes
+            .saturating_sub(start.logical_read_bytes);
+        let storage_read = self
+            .storage_read_bytes
+            .saturating_sub(start.storage_read_bytes);
+        let _ = writeln!(
+            report,
+            "process_logical_read_throughput: {}",
+            rate_text(logical_read, elapsed)
+        );
+        let _ = writeln!(
+            report,
+            "process_storage_read_throughput: {}",
+            rate_text(storage_read, elapsed)
+        );
+        delta_line(
+            report,
+            "minor_page_faults",
+            self.minor_faults,
+            start.minor_faults,
+        );
+        delta_line(
+            report,
+            "major_page_faults",
+            self.major_faults,
+            start.major_faults,
+        );
+        delta_line(
+            report,
+            "voluntary_context_switches",
+            self.voluntary_context_switches,
+            start.voluntary_context_switches,
+        );
+        delta_line(
+            report,
+            "involuntary_context_switches",
+            self.involuntary_context_switches,
+            start.involuntary_context_switches,
+        );
+        let _ = writeln!(report, "threads_at_end: {}", self.threads);
+        write_snapshot_bytes(report, "resident_memory", self.resident_memory);
+        write_snapshot_bytes(report, "peak_resident_memory", self.peak_resident_memory);
+        write_snapshot_bytes(report, "virtual_memory", self.virtual_memory);
+        write_snapshot_bytes(report, "peak_virtual_memory", self.peak_virtual_memory);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_number(value: &str) -> u64 {
+    value
+        .split_whitespace()
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_proc_kib(value: &str) -> u64 {
+    parse_proc_number(value).saturating_mul(1024)
+}
+
+#[cfg(target_os = "linux")]
+fn write_snapshot_bytes(report: &mut String, label: &str, value: u64) {
+    let _ = writeln!(report, "{label}: {value} ({})", bytes_text(value));
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Default)]
+struct ProcessSnapshot {
+    available: bool,
+    user_us: u64,
+    system_us: u64,
+    peak_resident_memory: u64,
+    minor_faults: u64,
+    major_faults: u64,
+    input_blocks: u64,
+    output_blocks: u64,
+    voluntary_context_switches: u64,
+    involuntary_context_switches: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl ProcessSnapshot {
+    fn capture() -> Self {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        let available = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } == 0;
+        if !available {
+            return Self::default();
+        }
+        let usage = unsafe { usage.assume_init() };
+        Self {
+            available: true,
+            user_us: timeval_micros(usage.ru_utime),
+            system_us: timeval_micros(usage.ru_stime),
+            peak_resident_memory: usage.ru_maxrss.max(0) as u64,
+            minor_faults: usage.ru_minflt.max(0) as u64,
+            major_faults: usage.ru_majflt.max(0) as u64,
+            input_blocks: usage.ru_inblock.max(0) as u64,
+            output_blocks: usage.ru_oublock.max(0) as u64,
+            voluntary_context_switches: usage.ru_nvcsw.max(0) as u64,
+            involuntary_context_switches: usage.ru_nivcsw.max(0) as u64,
+        }
+    }
+
+    fn write_delta(self, start: &Self, elapsed: Duration, report: &mut String) {
+        if !self.available || !start.available {
+            report.push_str("native_process_counters: unavailable\n");
+            return;
+        }
+        let user = self.user_us.saturating_sub(start.user_us) as f64 / 1_000_000.0;
+        let kernel = self.system_us.saturating_sub(start.system_us) as f64 / 1_000_000.0;
+        let cpu = user + kernel;
+        let capacity = elapsed.as_secs_f64() * num_cpus::get().max(1) as f64;
+        let _ = writeln!(report, "cpu_kernel_time: {kernel:.6} s");
+        let _ = writeln!(report, "cpu_user_time: {user:.6} s");
+        let _ = writeln!(report, "cpu_total_time: {cpu:.6} s");
+        let _ = writeln!(
+            report,
+            "cpu_utilization_all_logical: {:.2}%",
+            if capacity > 0.0 {
+                cpu / capacity * 100.0
+            } else {
+                0.0
+            }
+        );
+        delta_line(
+            report,
+            "minor_page_faults",
+            self.minor_faults,
+            start.minor_faults,
+        );
+        delta_line(
+            report,
+            "major_page_faults",
+            self.major_faults,
+            start.major_faults,
+        );
+        delta_line(
+            report,
+            "filesystem_input_blocks",
+            self.input_blocks,
+            start.input_blocks,
+        );
+        delta_line(
+            report,
+            "filesystem_output_blocks",
+            self.output_blocks,
+            start.output_blocks,
+        );
+        delta_line(
+            report,
+            "voluntary_context_switches",
+            self.voluntary_context_switches,
+            start.voluntary_context_switches,
+        );
+        delta_line(
+            report,
+            "involuntary_context_switches",
+            self.involuntary_context_switches,
+            start.involuntary_context_switches,
+        );
+        let _ = writeln!(
+            report,
+            "peak_resident_memory: {} ({})",
+            self.peak_resident_memory,
+            bytes_text(self.peak_resident_memory)
+        );
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn timeval_micros(value: libc::timeval) -> u64 {
+    (value.tv_sec.max(0) as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(value.tv_usec.max(0) as u64)
+}
+
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
 #[derive(Clone, Copy, Default)]
 struct ProcessSnapshot;
 
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux"), not(target_os = "macos")))]
 impl ProcessSnapshot {
     fn capture() -> Self {
         Self
@@ -1211,5 +1848,36 @@ mod tests {
         assert!(report.contains("timing_sample_interval: 1/64 operations"));
         assert!(report.contains("Processing process counters"));
         assert!(report.contains("Whole-session process counters"));
+        #[cfg(windows)]
+        assert!(report.contains("Windows I/O pipeline"));
+        #[cfg(target_os = "linux")]
+        {
+            assert!(report.contains("Linux async cached I/O pipeline"));
+            assert!(!report.contains("Windows I/O pipeline"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parses_linux_proc_stat_with_spaces_in_process_name() {
+        let mut fields = vec!["0"; 22];
+        fields[0] = "S";
+        fields[7] = "11";
+        fields[9] = "3";
+        fields[11] = "101";
+        fields[12] = "29";
+        let stat = format!("123 (VeriHash worker) {}", fields.join(" "));
+        let mut snapshot = ProcessSnapshot::default();
+        assert!(snapshot.parse_stat(&stat));
+        assert_eq!(snapshot.minor_faults, 11);
+        assert_eq!(snapshot.major_faults, 3);
+        assert_eq!(snapshot.user_ticks, 101);
+        assert_eq!(snapshot.system_ticks, 29);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn decodes_linux_mountinfo_escapes() {
+        assert_eq!(decode_mount_field("/media/My\\040Disk"), "/media/My Disk");
     }
 }
