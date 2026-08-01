@@ -1,3 +1,6 @@
+#![cfg_attr(not(windows), allow(dead_code))]
+
+use crate::io_feedback::IoWindow;
 use crate::scanner::ScanSummary;
 use anyhow::{Context, Result};
 use std::cell::RefCell;
@@ -162,11 +165,17 @@ struct Metrics {
     parallel_min: AtomicU64,
     parallel_max: AtomicU64,
     parallel_samples: AtomicU64,
+    parallel_first_limit_sample: AtomicU64,
+    parallel_samples_at_limit: AtomicU64,
     parallel_active_sum: AtomicU64,
     parallel_active_max: AtomicU64,
     parallel_increases: AtomicU64,
     parallel_decreases: AtomicU64,
     tuner_sample_bytes: AtomicU64,
+    tuner_latency_windows: AtomicU64,
+    tuner_latency_samples: AtomicU64,
+    tuner_p95_max_ns: AtomicU64,
+    tuner_p99_max_ns: AtomicU64,
 }
 
 impl Metrics {
@@ -222,11 +231,17 @@ impl Metrics {
             parallel_min: AtomicU64::new(u64::MAX),
             parallel_max: AtomicU64::new(0),
             parallel_samples: AtomicU64::new(0),
+            parallel_first_limit_sample: AtomicU64::new(u64::MAX),
+            parallel_samples_at_limit: AtomicU64::new(0),
             parallel_active_sum: AtomicU64::new(0),
             parallel_active_max: AtomicU64::new(0),
             parallel_increases: AtomicU64::new(0),
             parallel_decreases: AtomicU64::new(0),
             tuner_sample_bytes: AtomicU64::new(0),
+            tuner_latency_windows: AtomicU64::new(0),
+            tuner_latency_samples: AtomicU64::new(0),
+            tuner_p95_max_ns: AtomicU64::new(0),
+            tuner_p99_max_ns: AtomicU64::new(0),
         }
     }
 }
@@ -555,7 +570,16 @@ pub fn record_parallelism_config(initial: usize, maximum: usize) {
 
 pub fn record_parallelism_sample(target: usize, active: usize, bytes: u64) {
     let Some(metrics) = metrics() else { return };
-    metrics.parallel_samples.fetch_add(1, Ordering::Relaxed);
+    let sample = metrics.parallel_samples.fetch_add(1, Ordering::Relaxed) + 1;
+    let limit = metrics.parallel_limit.load(Ordering::Relaxed);
+    if limit > 0 && target as u64 >= limit {
+        metrics
+            .parallel_first_limit_sample
+            .fetch_min(sample, Ordering::Relaxed);
+        metrics
+            .parallel_samples_at_limit
+            .fetch_add(1, Ordering::Relaxed);
+    }
     metrics
         .parallel_min
         .fetch_min(target as u64, Ordering::Relaxed);
@@ -587,6 +611,25 @@ pub fn record_parallelism_change(increased: bool, target: usize) {
     metrics
         .parallel_max
         .fetch_max(target as u64, Ordering::Relaxed);
+}
+
+pub fn record_tuner_latency_window(window: &IoWindow) {
+    let Some(metrics) = metrics() else { return };
+    if window.samples == 0 {
+        return;
+    }
+    metrics
+        .tuner_latency_windows
+        .fetch_add(1, Ordering::Relaxed);
+    metrics
+        .tuner_latency_samples
+        .fetch_add(window.samples, Ordering::Relaxed);
+    metrics
+        .tuner_p95_max_ns
+        .fetch_max(window.p95_ns, Ordering::Relaxed);
+    metrics
+        .tuner_p99_max_ns
+        .fetch_max(window.p99_ns, Ordering::Relaxed);
 }
 
 fn metrics() -> Option<&'static Metrics> {
@@ -835,6 +878,17 @@ impl Metrics {
         );
         line_atomic(&mut report, "observed_parallelism_max", &self.parallel_max);
         line_atomic(&mut report, "tuner_samples", &self.parallel_samples);
+        line_atomic_or_na(
+            &mut report,
+            "first_limit_sample_400ms",
+            &self.parallel_first_limit_sample,
+            u64::MAX,
+        );
+        line_atomic(
+            &mut report,
+            "tuner_samples_at_limit",
+            &self.parallel_samples_at_limit,
+        );
         line_atomic(
             &mut report,
             "observed_active_parallelism_max",
@@ -844,6 +898,9 @@ impl Metrics {
         if samples > 0 {
             let average = self.parallel_active_sum.load(Ordering::Relaxed) as f64 / samples as f64;
             let _ = writeln!(report, "observed_active_parallelism_avg: {average:.2}");
+            let at_limit = self.parallel_samples_at_limit.load(Ordering::Relaxed);
+            let percent = at_limit as f64 * 100.0 / samples as f64;
+            let _ = writeln!(report, "tuner_time_at_limit: {percent:.2}%");
         }
         line_atomic(&mut report, "tuner_increases", &self.parallel_increases);
         line_atomic(&mut report, "tuner_decreases", &self.parallel_decreases);
@@ -852,6 +909,18 @@ impl Metrics {
             "bytes_observed_by_tuner",
             &self.tuner_sample_bytes,
         );
+        line_atomic(
+            &mut report,
+            "tuner_latency_windows",
+            &self.tuner_latency_windows,
+        );
+        line_atomic(
+            &mut report,
+            "tuner_latency_samples",
+            &self.tuner_latency_samples,
+        );
+        line_duration(&mut report, "tuner_p95_max", &self.tuner_p95_max_ns);
+        line_duration(&mut report, "tuner_p99_max", &self.tuner_p99_max_ns);
 
         let processing_start = *self
             .processing_start

@@ -1,3 +1,4 @@
+use crate::io_feedback::IoFeedback;
 use crate::performance;
 use crate::progress::ProgressCounters;
 use std::sync::Arc;
@@ -94,7 +95,7 @@ impl AdaptiveGate {
         self.target.load(Ordering::Relaxed)
     }
 
-    fn active(&self) -> usize {
+    pub fn active(&self) -> usize {
         self.active.load(Ordering::Relaxed)
     }
 
@@ -133,8 +134,12 @@ pub struct AdaptiveTuner {
 }
 
 impl AdaptiveTuner {
-    pub fn start(gate: Arc<AdaptiveGate>, counters: Arc<ProgressCounters>) -> Self {
-        if gate.maximum <= 1 || gate.target() == gate.maximum {
+    pub fn start(
+        gate: Arc<AdaptiveGate>,
+        counters: Arc<ProgressCounters>,
+        feedback: Arc<IoFeedback>,
+    ) -> Self {
+        if gate.maximum <= 1 {
             return Self {
                 stop: Arc::new(AtomicBool::new(true)),
                 handle: None,
@@ -143,41 +148,7 @@ impl AdaptiveTuner {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            let mut previous_bytes = counters.bytes.load(Ordering::Relaxed);
-            let mut previous_delta = 0u64;
-            let mut regressions = 0u8;
-            while !thread_stop.load(Ordering::Acquire) {
-                thread::park_timeout(Duration::from_millis(400));
-                if thread_stop.load(Ordering::Acquire) {
-                    break;
-                }
-                let bytes = counters.bytes.load(Ordering::Relaxed);
-                let delta = bytes.saturating_sub(previous_bytes);
-                previous_bytes = bytes;
-                performance::record_parallelism_sample(gate.target(), gate.active(), delta);
-                if delta == 0 {
-                    continue;
-                }
-
-                if previous_delta > 0
-                    && delta.saturating_mul(100) < previous_delta.saturating_mul(75)
-                {
-                    regressions = regressions.saturating_add(1);
-                    if regressions >= 2 {
-                        gate.decrease();
-                        regressions = 0;
-                    }
-                } else {
-                    regressions = 0;
-                    if gate.active() >= gate.target()
-                        && (previous_delta == 0
-                            || delta.saturating_mul(100) >= previous_delta.saturating_mul(95))
-                    {
-                        gate.increase();
-                    }
-                }
-                previous_delta = delta;
-            }
+            run_throughput_tuner(thread_stop, gate, counters, feedback);
         });
         Self {
             stop,
@@ -191,6 +162,52 @@ impl AdaptiveTuner {
             handle.thread().unpark();
             let _ = handle.join();
         }
+    }
+}
+
+fn run_throughput_tuner(
+    thread_stop: Arc<AtomicBool>,
+    gate: Arc<AdaptiveGate>,
+    counters: Arc<ProgressCounters>,
+    feedback: Arc<IoFeedback>,
+) {
+    let mut previous_bytes = counters.bytes.load(Ordering::Relaxed);
+    let mut previous_io = feedback.snapshot();
+    let mut previous_delta = 0u64;
+    let mut regressions = 0u8;
+    while !thread_stop.load(Ordering::Acquire) {
+        thread::park_timeout(Duration::from_millis(400));
+        if thread_stop.load(Ordering::Acquire) {
+            break;
+        }
+        let bytes = counters.bytes.load(Ordering::Relaxed);
+        let delta = bytes.saturating_sub(previous_bytes);
+        previous_bytes = bytes;
+        let latency = feedback.window_since(&mut previous_io);
+        performance::record_parallelism_sample(gate.target(), gate.active(), delta);
+        if latency.samples > 0 {
+            performance::record_tuner_latency_window(&latency);
+        }
+        if delta == 0 {
+            continue;
+        }
+
+        if previous_delta > 0 && delta.saturating_mul(100) < previous_delta.saturating_mul(75) {
+            regressions = regressions.saturating_add(1);
+            if regressions >= 2 {
+                gate.decrease();
+                regressions = 0;
+            }
+        } else {
+            regressions = 0;
+            if gate.active() >= gate.target()
+                && (previous_delta == 0
+                    || delta.saturating_mul(100) >= previous_delta.saturating_mul(95))
+            {
+                gate.increase();
+            }
+        }
+        previous_delta = delta;
     }
 }
 

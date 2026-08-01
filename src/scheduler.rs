@@ -1,6 +1,7 @@
 use crate::algorithm::Algorithm;
 use crate::concurrency::{AdaptiveGate, AdaptiveTuner, FixedGate};
 use crate::hashing::{HashWorker, bulk_lane_policy, parallelism_limits};
+use crate::io_feedback::IoFeedback;
 use crate::progress::{ProgressCounters, ProgressEvent, ProgressRenderer, ProgressResult};
 use crate::scanner::{FileEntry, ScanPlan};
 use crate::spool::{ComputedFile, ResultSpool, SpoolWriter};
@@ -34,7 +35,9 @@ struct WorkerContext {
     counters: Arc<ProgressCounters>,
     algorithms: Vec<Algorithm>,
     parallelism: usize,
+    total_files: u64,
     gate: Arc<AdaptiveGate>,
+    feedback: Arc<IoFeedback>,
 }
 
 pub struct ComputeOutcome {
@@ -57,8 +60,13 @@ pub fn compute(
         Some(&summary.workload),
     );
     let counters = Arc::new(ProgressCounters::default());
+    let feedback = Arc::new(IoFeedback::default());
     let gate = Arc::new(AdaptiveGate::new(initial_parallelism, worker_count));
-    let tuner = AdaptiveTuner::start(Arc::clone(&gate), Arc::clone(&counters));
+    let tuner = AdaptiveTuner::start(
+        Arc::clone(&gate),
+        Arc::clone(&counters),
+        Arc::clone(&feedback),
+    );
     let renderer = ProgressRenderer::start(summary.bytes, Arc::clone(&counters));
     let progress_sender = renderer.sender();
     let (task_sender, task_receiver) = bounded::<TaskBatch>(worker_count * 2);
@@ -81,6 +89,7 @@ pub fn compute(
             let events = progress_sender.clone();
             let counters = Arc::clone(&counters);
             let gate = Arc::clone(&gate);
+            let feedback = Arc::clone(&feedback);
             let algorithms = algorithms.clone();
             scope.spawn(move || {
                 worker_loop(
@@ -91,7 +100,9 @@ pub fn compute(
                         counters,
                         algorithms,
                         parallelism: worker_count,
+                        total_files: summary.files,
                         gate,
+                        feedback,
                     },
                 )
             });
@@ -163,7 +174,8 @@ fn flush_batch(
 
 fn worker_loop(tasks: Receiver<TaskBatch>, context: WorkerContext) {
     let mut hash_worker =
-        HashWorker::new(context.parallelism).map_err(|error| format!("{error:#}"));
+        HashWorker::with_feedback(context.parallelism, Arc::clone(&context.feedback))
+            .map_err(|error| format!("{error:#}"));
     let mut pending_bytes = 0u64;
     let mut last_flush = Instant::now();
     for batch in tasks {
@@ -171,7 +183,11 @@ fn worker_loop(tasks: Receiver<TaskBatch>, context: WorkerContext) {
             let _bulk_permit = batch.bulk_gate.as_ref().map(|gate| gate.acquire());
             let _permit = context.gate.acquire();
             if let Ok(worker) = &mut hash_worker {
-                worker.set_parallelism(context.gate.target());
+                worker.set_parallelism(effective_parallelism(
+                    &context.gate,
+                    &context.counters,
+                    context.total_files,
+                ));
             }
             let display_path = file.relative.display().to_string();
             context.counters.active.fetch_add(1, Ordering::Relaxed);
@@ -230,6 +246,20 @@ fn worker_loop(tasks: Receiver<TaskBatch>, context: WorkerContext) {
             context.counters.active.fetch_sub(1, Ordering::Relaxed);
         }
     }
+}
+
+fn effective_parallelism(
+    gate: &AdaptiveGate,
+    counters: &ProgressCounters,
+    total_files: u64,
+) -> usize {
+    let active = gate.active();
+    let remaining = total_files.saturating_sub(counters.files.load(Ordering::Relaxed));
+    usize::try_from(remaining)
+        .unwrap_or(usize::MAX)
+        .min(gate.target())
+        .max(active)
+        .max(1)
 }
 
 fn collect_results(

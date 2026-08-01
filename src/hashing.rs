@@ -1,4 +1,5 @@
 use crate::algorithm::{Algorithm, DigestValue};
+use crate::io_feedback::IoFeedback;
 use crate::scanner::WorkloadSummary;
 #[cfg(not(windows))]
 use anyhow::Context;
@@ -12,6 +13,7 @@ use std::fs::{File, OpenOptions};
 #[cfg(not(windows))]
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 #[cfg(windows)]
 mod windows;
@@ -163,12 +165,14 @@ pub struct HashWorker {
 }
 
 impl HashWorker {
-    pub fn new(parallelism: usize) -> Result<Self> {
+    pub fn with_feedback(parallelism: usize, feedback: Arc<IoFeedback>) -> Result<Self> {
+        #[cfg(not(windows))]
+        let _ = (parallelism, feedback);
         Ok(Self {
             #[cfg(not(windows))]
             buffer: Vec::new(),
             #[cfg(windows)]
-            inner: windows::WindowsHashWorker::new(parallelism)?,
+            inner: windows::WindowsHashWorker::new(parallelism, feedback)?,
         })
     }
 

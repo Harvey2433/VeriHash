@@ -1,4 +1,5 @@
 use super::{Algorithm, DigestValue, MultiHasher};
+use crate::io_feedback::{self, IoFeedback};
 use crate::performance;
 use crate::scanner::WorkloadSummary;
 use anyhow::{Context, Result, anyhow};
@@ -14,7 +15,7 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::ptr::{NonNull, null, null_mut};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -372,15 +373,17 @@ pub struct WindowsHashWorker {
     buffers: Vec<AlignedBuffer>,
     profiles: Vec<StorageProfile>,
     parallelism: usize,
+    feedback: Arc<IoFeedback>,
 }
 
 impl WindowsHashWorker {
-    pub fn new(parallelism: usize) -> Result<Self> {
+    pub fn new(parallelism: usize, feedback: Arc<IoFeedback>) -> Result<Self> {
         Ok(Self {
             runtime: Runtime::new().context("无法创建 Windows IOCP runtime")?,
             buffers: Vec::new(),
             profiles: Vec::new(),
             parallelism: parallelism.max(1),
+            feedback,
         })
     }
 
@@ -430,6 +433,7 @@ impl WindowsHashWorker {
                 buffers,
                 pending_limit,
                 direct,
+                feedback: Arc::clone(&self.feedback),
             },
             &mut on_read,
         ));
@@ -448,6 +452,7 @@ impl WindowsHashWorker {
                     buffers: attempt.buffers,
                     pending_limit,
                     direct: false,
+                    feedback: Arc::clone(&self.feedback),
                 },
                 &mut on_read,
             ));
@@ -512,9 +517,16 @@ struct ReadPipelineConfig {
     buffers: Vec<AlignedBuffer>,
     pending_limit: usize,
     direct: bool,
+    feedback: Arc<IoFeedback>,
 }
 
 type PendingRead = JoinHandle<(io::Result<usize>, AlignedBuffer)>;
+
+#[derive(Clone, Copy)]
+struct ReadWindow {
+    expected_size: u64,
+    pending_limit: usize,
+}
 
 async fn read_and_hash<F>(
     path: &Path,
@@ -531,8 +543,13 @@ where
         buffers,
         pending_limit,
         direct,
+        feedback,
     } = config;
     let mut processed = 0u64;
+    let read_window = ReadWindow {
+        expected_size,
+        pending_limit,
+    };
     let mut idle = buffers;
     let mut pending = VecDeque::<PendingRead>::new();
     let mut direct_active = direct;
@@ -563,9 +580,9 @@ where
         &mut idle,
         &mut pending,
         &mut next_submit,
-        expected_size,
-        pending_limit,
+        read_window,
         direct_active,
+        &feedback,
     );
     yield_to_runtime().await;
     loop {
@@ -612,9 +629,9 @@ where
                     &mut idle,
                     &mut pending,
                     &mut next_submit,
-                    expected_size,
-                    pending_limit,
+                    read_window,
                     direct_active,
+                    &feedback,
                 );
                 continue;
             }
@@ -653,9 +670,9 @@ where
                     &mut idle,
                     &mut pending,
                     &mut next_submit,
-                    expected_size,
-                    pending_limit,
+                    read_window,
                     direct_active,
+                    &feedback,
                 );
                 continue;
             }
@@ -687,9 +704,9 @@ where
                 &mut idle,
                 &mut pending,
                 &mut next_submit,
-                expected_size,
-                pending_limit,
+                read_window,
                 direct_active,
+                &feedback,
             );
         }
 
@@ -741,9 +758,9 @@ where
             &mut idle,
             &mut pending,
             &mut next_submit,
-            expected_size,
-            pending_limit,
+            read_window,
             direct_active,
+            &feedback,
         );
     }
 }
@@ -753,17 +770,18 @@ fn submit_reads(
     idle: &mut Vec<AlignedBuffer>,
     pending: &mut VecDeque<PendingRead>,
     next_submit: &mut u64,
-    expected_size: u64,
-    pending_limit: usize,
+    window: ReadWindow,
     direct: bool,
+    feedback: &Arc<IoFeedback>,
 ) {
-    while pending.len() < pending_limit && *next_submit < expected_size {
+    while pending.len() < window.pending_limit && *next_submit < window.expected_size {
         let Some(buffer) = idle.pop() else { break };
         let offset = *next_submit;
         *next_submit = next_submit.saturating_add(buffer.request_size() as u64);
         let file = file.clone();
+        let feedback = io_feedback::sample_due().then(|| Arc::clone(feedback));
         pending.push_back(spawn(async move {
-            read_owned(file, buffer, offset, direct).await
+            read_owned(file, buffer, offset, direct, feedback).await
         }));
     }
 }
@@ -781,16 +799,22 @@ async fn read_owned(
     mut buffer: AlignedBuffer,
     offset: u64,
     direct: bool,
+    feedback: Option<Arc<IoFeedback>>,
 ) -> (io::Result<usize>, AlignedBuffer) {
     unsafe { buffer.set_len(0) };
-    let started = performance::sample_read_timing().then(Instant::now);
+    let report_timing = performance::sample_read_timing();
+    let started = (report_timing || feedback.is_some()).then(Instant::now);
     let BufResult(read, buffer) = file.read_at(buffer, offset).await;
+    let elapsed = started.map(|started| started.elapsed());
     performance::record_read(
         direct,
         read.as_ref().copied().unwrap_or(0),
         read.is_ok(),
-        started.map(|started| started.elapsed()),
+        report_timing.then_some(elapsed).flatten(),
     );
+    if let (Some(feedback), Some(elapsed)) = (feedback, elapsed) {
+        feedback.record(read.as_ref().copied().unwrap_or(0), elapsed);
+    }
     (read, buffer)
 }
 
@@ -1655,7 +1679,7 @@ mod tests {
     fn direct_io_hashes_unaligned_file_tails() {
         let directory = tempfile::tempdir().unwrap();
         let sizes = [1usize, 511, 512, 4095, 4096, 4097, 65_537, 2_097_155];
-        let mut worker = WindowsHashWorker::new(1).unwrap();
+        let mut worker = WindowsHashWorker::new(1, Arc::new(IoFeedback::default())).unwrap();
         for size in sizes {
             let bytes = (0..size)
                 .map(|index| (index.wrapping_mul(31) & 0xff) as u8)
@@ -1683,7 +1707,7 @@ mod tests {
         let path = directory.path().join("shortened.bin");
         fs::write(&path, vec![0x5A; 4096]).unwrap();
         let mut progress = 0u64;
-        let error = WindowsHashWorker::new(1)
+        let error = WindowsHashWorker::new(1, Arc::new(IoFeedback::default()))
             .unwrap()
             .hash_file(&path, 8192, &[Algorithm::Sha256], |read| progress += read)
             .unwrap_err();
@@ -1754,7 +1778,7 @@ mod tests {
 
         let mut progress = 0u64;
         let actual_started = Instant::now();
-        let actual = WindowsHashWorker::new(1)
+        let actual = WindowsHashWorker::new(1, Arc::new(IoFeedback::default()))
             .unwrap()
             .hash_file(&path, SIZE, &[Algorithm::Blake3], |read| progress += read)
             .unwrap();

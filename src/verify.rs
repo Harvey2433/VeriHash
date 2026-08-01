@@ -3,6 +3,7 @@ use crate::concurrency::{AdaptiveGate, AdaptiveTuner};
 use crate::format::detect::{self, Manifest};
 use crate::format::write_atomic;
 use crate::hashing::{HashWorker, parallelism_limits};
+use crate::io_feedback::IoFeedback;
 use crate::progress::{ProgressCounters, ProgressEvent, ProgressRenderer, ProgressResult};
 use crate::scanner::{InputSpec, ScanPlan, ScanSummary};
 use anyhow::{Context, Result, anyhow, bail};
@@ -79,6 +80,16 @@ enum CheckResult {
     },
     Failed(String),
     Error(String),
+}
+
+struct VerifyWorkerContext {
+    results: Sender<CheckResult>,
+    events: Sender<ProgressEvent>,
+    counters: Arc<ProgressCounters>,
+    parallelism: usize,
+    total_jobs: u64,
+    gate: Arc<AdaptiveGate>,
+    feedback: Arc<IoFeedback>,
 }
 
 struct VerificationReportSpool {
@@ -467,10 +478,16 @@ pub fn verify(discovery: &Discovery) -> Result<VerificationOutcome> {
         None,
     );
     let counters = Arc::new(ProgressCounters::default());
+    let feedback = Arc::new(IoFeedback::default());
     let gate = Arc::new(AdaptiveGate::new(initial_parallelism, workers));
-    let tuner = AdaptiveTuner::start(Arc::clone(&gate), Arc::clone(&counters));
+    let tuner = AdaptiveTuner::start(
+        Arc::clone(&gate),
+        Arc::clone(&counters),
+        Arc::clone(&feedback),
+    );
     let renderer = ProgressRenderer::start(total_bytes, Arc::clone(&counters));
     let events = renderer.sender();
+    let total_jobs = discovery.jobs.len() as u64;
     let (task_sender, task_receiver) = bounded::<VerificationJob>(workers * 2);
     let (result_sender, result_receiver) = bounded::<CheckResult>(workers * 2);
     let collector = thread::spawn(move || collect_verification_results(result_receiver));
@@ -482,7 +499,21 @@ pub fn verify(discovery: &Discovery) -> Result<VerificationOutcome> {
             let events = events.clone();
             let counters = Arc::clone(&counters);
             let gate = Arc::clone(&gate);
-            scope.spawn(move || verify_worker(tasks, results, events, counters, workers, gate));
+            let feedback = Arc::clone(&feedback);
+            scope.spawn(move || {
+                verify_worker(
+                    tasks,
+                    VerifyWorkerContext {
+                        results,
+                        events,
+                        counters,
+                        parallelism: workers,
+                        total_jobs,
+                        gate,
+                        feedback,
+                    },
+                )
+            });
         }
         drop(task_receiver);
         for job in &discovery.jobs {
@@ -563,24 +594,27 @@ fn report_field(value: &str) -> String {
         .replace('\n', "\\n")
 }
 
-fn verify_worker(
-    tasks: Receiver<VerificationJob>,
-    results: Sender<CheckResult>,
-    events: Sender<ProgressEvent>,
-    counters: Arc<ProgressCounters>,
-    parallelism: usize,
-    gate: Arc<AdaptiveGate>,
-) {
-    let mut hash_worker = HashWorker::new(parallelism).map_err(|error| format!("{error:#}"));
+fn verify_worker(tasks: Receiver<VerificationJob>, context: VerifyWorkerContext) {
+    let mut hash_worker =
+        HashWorker::with_feedback(context.parallelism, Arc::clone(&context.feedback))
+            .map_err(|error| format!("{error:#}"));
     let mut pending_bytes = 0u64;
     let mut last_flush = Instant::now();
     for job in tasks {
-        let _permit = gate.acquire();
+        let _permit = context.gate.acquire();
         if let Ok(worker) = &mut hash_worker {
-            worker.set_parallelism(gate.target());
+            let remaining = context
+                .total_jobs
+                .saturating_sub(context.counters.files.load(Ordering::Relaxed));
+            let effective = usize::try_from(remaining)
+                .unwrap_or(usize::MAX)
+                .min(context.gate.target())
+                .max(context.gate.active())
+                .max(1);
+            worker.set_parallelism(effective);
         }
         let display_path = job.relative.display().to_string();
-        counters.active.fetch_add(1, Ordering::Relaxed);
+        context.counters.active.fetch_add(1, Ordering::Relaxed);
         let algorithms = job.expected.keys().cloned().collect::<Vec<_>>();
         let result = match &mut hash_worker {
             Ok(worker) => worker.hash_file(&job.path, job.size, &algorithms, |bytes| {
@@ -588,7 +622,10 @@ fn verify_worker(
                 if pending_bytes >= PROGRESS_BYTE_FLUSH
                     || last_flush.elapsed() >= PROGRESS_TIME_FLUSH
                 {
-                    counters.bytes.fetch_add(pending_bytes, Ordering::Relaxed);
+                    context
+                        .counters
+                        .bytes
+                        .fetch_add(pending_bytes, Ordering::Relaxed);
                     pending_bytes = 0;
                     last_flush = Instant::now();
                 }
@@ -596,11 +633,14 @@ fn verify_worker(
             Err(error) => Err(anyhow!(error.clone())),
         };
         if pending_bytes > 0 {
-            counters.bytes.fetch_add(pending_bytes, Ordering::Relaxed);
+            context
+                .counters
+                .bytes
+                .fetch_add(pending_bytes, Ordering::Relaxed);
             pending_bytes = 0;
             last_flush = Instant::now();
         }
-        counters.files.fetch_add(1, Ordering::Relaxed);
+        context.counters.files.fetch_add(1, Ordering::Relaxed);
         let check = match result {
             Ok(hashes) => {
                 let mismatches = hashes
@@ -624,12 +664,12 @@ fn verify_worker(
                         algorithms,
                     }
                 } else {
-                    counters.failed.fetch_add(1, Ordering::Relaxed);
+                    context.counters.failed.fetch_add(1, Ordering::Relaxed);
                     CheckResult::Failed(mismatches.join("; "))
                 }
             }
             Err(error) => {
-                counters.failed.fetch_add(1, Ordering::Relaxed);
+                context.counters.failed.fetch_add(1, Ordering::Relaxed);
                 CheckResult::Error(format!("{}: {error:#}", job.relative.display()))
             }
         };
@@ -638,14 +678,14 @@ fn verify_worker(
             CheckResult::Failed(_) => ProgressResult::Mismatch,
             CheckResult::Error(_) => ProgressResult::Error,
         };
-        if results.send(check).is_err() {
+        if context.results.send(check).is_err() {
             return;
         }
-        let _ = events.send(ProgressEvent::Finished {
+        let _ = context.events.send(ProgressEvent::Finished {
             path: display_path,
             result: progress_result,
         });
-        counters.active.fetch_sub(1, Ordering::Relaxed);
+        context.counters.active.fetch_sub(1, Ordering::Relaxed);
     }
 }
 

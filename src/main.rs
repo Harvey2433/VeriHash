@@ -4,6 +4,7 @@ mod concurrency;
 mod format;
 mod hashing;
 mod interaction;
+mod io_feedback;
 mod performance;
 mod progress;
 mod scanner;
